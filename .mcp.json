@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ccwire": {
+      "command": "bun",
+      "args": ["run", "${CLAUDE_PLUGIN_ROOT}/src/server.ts"]
+    }
+  }
+}
