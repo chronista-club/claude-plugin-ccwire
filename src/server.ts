@@ -189,6 +189,97 @@ async function acknowledgeMessage(messageId: string, sessionName: string): Promi
   return false;
 }
 
+async function findMessageById(messageId: string): Promise<Message | null> {
+  try {
+    const dirs = await readdir(MESSAGES_DIR);
+    for (const dir of dirs) {
+      const filePath = join(MESSAGES_DIR, dir, `${messageId}.json`);
+      try {
+        const data = await readFile(filePath, "utf-8");
+        return JSON.parse(data);
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+async function getAllMessages(): Promise<Message[]> {
+  const messages: Message[] = [];
+  try {
+    const dirs = await readdir(MESSAGES_DIR);
+    for (const dir of dirs) {
+      const dirPath = join(MESSAGES_DIR, dir);
+      try {
+        const files = await readdir(dirPath);
+        for (const file of files) {
+          if (!file.endsWith(".json")) continue;
+          try {
+            const data = await readFile(join(dirPath, file), "utf-8");
+            messages.push(JSON.parse(data));
+          } catch {}
+        }
+      } catch {}
+    }
+  } catch {}
+  return messages;
+}
+
+async function buildThread(messageId: string): Promise<Message[]> {
+  const allMessages = await getAllMessages();
+  const byId = new Map(allMessages.map((m) => [m.id, m]));
+
+  // Trace back to the root of the thread
+  let rootId = messageId;
+  const visited = new Set<string>();
+  while (true) {
+    if (visited.has(rootId)) break;
+    visited.add(rootId);
+    const msg = byId.get(rootId);
+    if (!msg || !msg.reply_to) break;
+    rootId = msg.reply_to;
+  }
+
+  // Collect all messages in the thread (forward from root)
+  const thread: Message[] = [];
+  const childrenMap = new Map<string, string[]>();
+
+  // Build parent → children mapping
+  for (const msg of allMessages) {
+    if (msg.reply_to) {
+      const children = childrenMap.get(msg.reply_to) ?? [];
+      children.push(msg.id);
+      childrenMap.set(msg.reply_to, children);
+    }
+  }
+
+  // Walk the chain from root
+  const queue = [rootId];
+  const seen = new Set<string>();
+  while (queue.length > 0) {
+    const id = queue.shift()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const msg = byId.get(id);
+    if (msg) {
+      thread.push(msg);
+      const children = childrenMap.get(id) ?? [];
+      // Sort children by timestamp
+      children.sort((a, b) => {
+        const ma = byId.get(a);
+        const mb = byId.get(b);
+        if (!ma || !mb) return 0;
+        return new Date(ma.timestamp).getTime() - new Date(mb.timestamp).getTime();
+      });
+      queue.push(...children);
+    }
+  }
+
+  // Sort by timestamp
+  thread.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+  return thread;
+}
+
 function cleanStaleSessions(sessions: Sessions): Sessions {
   const now = Date.now();
   const cleaned: Sessions = {};
@@ -534,6 +625,41 @@ server.registerTool("wire_ack", {
       }],
     };
   });
+});
+
+// ── wire_thread ────────────────────────────────
+
+server.registerTool("wire_thread", {
+  title: "Wire Thread",
+  description: "メッセージIDからスレッド（reply_toチェーン）全体を取得する。どのメッセージIDを指定しても、そのスレッドの先頭から末尾まで時系列で返す。",
+  inputSchema: {
+    message_id: z.string().describe("スレッド内の任意のメッセージID"),
+  },
+}, async ({ message_id }) => {
+  await ensureStore();
+
+  const thread = await buildThread(message_id);
+
+  if (thread.length === 0) {
+    return {
+      content: [{ type: "text" as const, text: `エラー: メッセージ "${message_id}" が見つからないか、スレッドを構築できません。` }],
+      isError: true,
+    };
+  }
+
+  const formatted = thread.map((msg, i) => {
+    const truncated = msg.content.length > 200 ? msg.content.slice(0, 200) + "..." : msg.content;
+    return `[${i + 1}] ${msg.from} (${msg.type})\n    ${msg.timestamp}\n    ${truncated}`;
+  }).join("\n\n");
+
+  const rootId = thread[0].id;
+
+  return {
+    content: [{
+      type: "text" as const,
+      text: `スレッド (${thread.length} messages, root: ${rootId}):\n\n${formatted}`,
+    }],
+  };
 });
 
 // ─────────────────────────────────────────────
