@@ -1,6 +1,6 @@
 {
   "name": "claude-plugin-ccwire",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "ccwire - CC間通信プロトコルのMCPサーバー",
   "type": "module",
   "scripts": {
