@@ -4,6 +4,7 @@ import { z } from "zod";
 import { mkdir, readFile, writeFile, readdir, unlink, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 
 // ─────────────────────────────────────────────
 // Constants
@@ -292,6 +293,24 @@ function cleanStaleSessions(sessions: Sessions): Sessions {
 }
 
 // ─────────────────────────────────────────────
+// tmux notification helper
+// ─────────────────────────────────────────────
+
+function execTmux(...args: string[]): Promise<void> {
+  return new Promise<void>((resolve) => {
+    execFile("tmux", args, (err) => resolve());
+  });
+}
+
+async function notifyViaTmux(tmuxTarget: string, message: string): Promise<void> {
+  // Send text first
+  await execTmux("send-keys", "-t", tmuxTarget, message);
+  // Wait then send Enter separately
+  await Bun.sleep(500);
+  await execTmux("send-keys", "-t", tmuxTarget, "Enter");
+}
+
+// ─────────────────────────────────────────────
 // In-memory session name for this MCP process
 // ─────────────────────────────────────────────
 
@@ -397,6 +416,15 @@ server.registerTool("wire_send", {
 
     await writeMessage(msg);
 
+    // Auto-notify via tmux if target has tmux_target
+    const targetSession = sessions[to];
+    if (targetSession?.tmux_target) {
+      await notifyViaTmux(
+        targetSession.tmux_target,
+        `wire_receiveで未読メッセージを確認して`
+      );
+    }
+
     return {
       content: [{
         type: "text" as const,
@@ -498,6 +526,17 @@ server.registerTool("wire_broadcast", {
     };
 
     await writeMessage(msg);
+
+    // Auto-notify all sessions with tmux_target
+    const recipients = Object.values(sessions).filter(
+      (s) => s.name !== currentSessionName && s.tmux_target
+    );
+    for (const s of recipients) {
+      await notifyViaTmux(
+        s.tmux_target!,
+        `wire_receiveで未読メッセージを確認して`
+      );
+    }
 
     const recipientCount = Object.keys(sessions).filter(n => n !== currentSessionName).length;
 
