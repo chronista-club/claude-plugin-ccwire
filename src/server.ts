@@ -626,6 +626,52 @@ server.registerTool("wire_status", {
   });
 });
 
+// ── wire_unregister ──────────────────────────
+
+server.registerTool("wire_unregister", {
+  title: "Wire Unregister",
+  description: "セッションの登録を解除する。省略時は自分自身を解除する。",
+  inputSchema: {
+    name: z.string().optional().describe("解除するセッション名。省略時は自分自身。"),
+  },
+}, async ({ name }) => {
+  const targetName = name ?? currentSessionName;
+
+  if (!targetName) {
+    return {
+      content: [{ type: "text" as const, text: "エラー: セッション名を指定するか、先に wire_register で登録してください。" }],
+      isError: true,
+    };
+  }
+
+  await ensureStore();
+
+  return await withFileLock(async () => {
+    const sessions = await readSessions();
+
+    if (!sessions[targetName]) {
+      return {
+        content: [{ type: "text" as const, text: `エラー: セッション "${targetName}" は登録されていません。` }],
+        isError: true,
+      };
+    }
+
+    delete sessions[targetName];
+    await writeSessions(sessions);
+
+    if (targetName === currentSessionName) {
+      currentSessionName = null;
+    }
+
+    return {
+      content: [{
+        type: "text" as const,
+        text: `セッション "${targetName}" の登録を解除しました。\n残りセッション数: ${Object.keys(sessions).length}`,
+      }],
+    };
+  });
+});
+
 // ── wire_ack ────────────────────────────────
 
 server.registerTool("wire_ack", {
