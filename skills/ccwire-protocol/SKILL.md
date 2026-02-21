@@ -7,6 +7,20 @@ description: CC間通信プロトコル。複数のClaude Codeセッション間
 
 CC間通信プロトコル。複数のClaude Codeセッションが同一マシン上で並行稼働する環境で、セッション同士がメッセージを交換する仕組み。
 
+## 自動登録（環境変数）
+
+プロセス管理側が以下の環境変数をセットすると、SessionStart 時に自動登録される:
+
+| 環境変数 | 必須 | 説明 |
+|----------|------|------|
+| `CCWIRE_SESSION_NAME` | Yes | セッション名 |
+| `CCWIRE_TMUX_TARGET` | No | tmux ターゲット |
+
+自動登録時は `wire_register` の手動呼び出しは不要（ただし MCP の currentSessionName 同期のため、会話の最初に一度だけ `wire_register(name="セッション名")` を実行する）。
+SessionEnd 時に自動で unregister される。
+
+環境変数が未設定の場合は従来通り手動 `wire_register` が必要。
+
 ## 使い方
 
 ### 1. セッション登録（必須・最初に行う）
@@ -69,11 +83,32 @@ wire_status()                 # 全体のステータス表示
 
 ステータス値: `idle`（待機中）, `busy`（作業中）, `done`（完了）
 
+### 8. セッション登録解除
+
+```
+wire_unregister(name="issue-2")  # 指定セッションを解除
+wire_unregister()                # 自分自身を解除
+```
+
+- 省略時は自分自身を解除
+- SessionEnd フックで自動実行されるため、通常は手動呼び出し不要
+
+### 9. スレッド取得
+
+```
+wire_thread(message_id="msg-xxxx-xxxx")
+```
+
+- スレッド内の**どのメッセージID**を指定しても、先頭から末尾まで時系列で返す
+- `reply_to`チェーンを自動的に辿ってLinked Listとして再構成
+- 過去の会話コンテキストを復元するのに便利
+
 ## MCP ツール一覧
 
 | ツール | パラメータ | 説明 |
 |--------|-----------|------|
 | `wire_register` | `name`, `tmux_target?` | セッション登録 |
+| `wire_unregister` | `name?` | セッション登録解除（省略時は自分自身） |
 | `wire_send` | `to`, `content`, `type?`, `reply_to?` | メッセージ送信 |
 | `wire_receive` | `limit?` | 未読メッセージ取得 |
 | `wire_broadcast` | `content` | 全体ブロードキャスト |
@@ -121,16 +156,6 @@ Session A:
 Session B, C, D:
   wire_receive() → ブロードキャストを受信
 ```
-
-### 8. スレッド取得
-
-```
-wire_thread(message_id="msg-xxxx-xxxx")
-```
-
-- スレッド内の**どのメッセージID**を指定しても、先頭から末尾まで時系列で返す
-- `reply_to`チェーンを自動的に辿ってLinked Listとして再構成
-- 過去の会話コンテキストを復元するのに便利
 
 ## アーキテクチャ
 
