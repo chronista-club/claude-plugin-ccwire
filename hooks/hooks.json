@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo '{\"additionalContext\": \"## ccwire-protocol\\n\\nCC間通信プロトコルが利用可能です。\\n\\n他のCCセッションと通信するには、まず `wire_register` でセッションを登録してください。\\n\\n```\\nwire_register(name=\\\"your-session-name\\\")\\n```\\n\\n登録後は wire_send / wire_receive でメッセージの送受信、wire_sessions でセッション一覧確認ができます。\"}'"
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/register.sh"
           }
         ]
       }
