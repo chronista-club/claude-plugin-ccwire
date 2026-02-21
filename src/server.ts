@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { mkdir, readFile, writeFile, readdir, unlink, stat } from "node:fs/promises";
+import { mkdir, readFile, writeFile, readdir, unlink, stat, rmdir } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -59,27 +59,24 @@ async function ensureStore(): Promise<void> {
 }
 
 async function withFileLock<T>(fn: () => Promise<T>): Promise<T> {
-  const lockPath = LOCK_FILE;
+  const lockDir = LOCK_FILE;
   const maxRetries = 50;
   const retryDelay = 100;
 
   for (let i = 0; i < maxRetries; i++) {
     try {
-      const fd = Bun.file(lockPath);
-      // Try to create lock file exclusively
-      await writeFile(lockPath, String(process.pid), { flag: "wx" });
+      await mkdir(lockDir, { recursive: false });
       try {
         return await fn();
       } finally {
-        await unlink(lockPath).catch(() => {});
+        await rmdir(lockDir).catch(() => {});
       }
     } catch (e: any) {
       if (e.code === "EEXIST") {
-        // Check if lock is stale (> 10 seconds)
         try {
-          const lockStat = await stat(lockPath);
+          const lockStat = await stat(lockDir);
           if (Date.now() - lockStat.mtimeMs > 10_000) {
-            await unlink(lockPath).catch(() => {});
+            await rmdir(lockDir).catch(() => {});
             continue;
           }
         } catch {}
