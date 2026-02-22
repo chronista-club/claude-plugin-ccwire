@@ -14,4 +14,5 @@ if [ ! -f "$DB_PATH" ]; then
   exit 0
 fi
 
-sqlite3 "$DB_PATH" "DELETE FROM sessions WHERE name = '$CCWIRE_SESSION_NAME';" 2>/dev/null
+SAFE_NAME=$(printf '%s' "$CCWIRE_SESSION_NAME" | sed "s/'/''/g")
+sqlite3 "$DB_PATH" "DELETE FROM sessions WHERE name = '$SAFE_NAME';" 2>/dev/null

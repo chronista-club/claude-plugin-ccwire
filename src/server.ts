@@ -98,6 +98,7 @@ function initDb(): void {
   db.run(`CREATE INDEX IF NOT EXISTS idx_messages_to_status ON messages("to", status)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_broadcast_deliveries_session ON broadcast_deliveries(session_name)`);
 }
 
 // ─────────────────────────────────────────────
@@ -292,28 +293,15 @@ server.registerTool("wire_receive", {
 
   touchSession(currentSessionName);
 
-  // Direct messages (pending, addressed to me)
-  const directMessages = db.query<MessageRow, [string, number]>(
+  // Direct + broadcast を統合クエリで取得（timestamp順、limit適用）
+  const allMessages = db.query<MessageRow, [string, string, string, number]>(
     `SELECT * FROM messages
-     WHERE "to" = ? AND status = 'pending'
+     WHERE ("to" = ? AND status = 'pending')
+        OR ("to" = '*' AND "from" != ?
+            AND id NOT IN (SELECT message_id FROM broadcast_deliveries WHERE session_name = ?))
      ORDER BY timestamp ASC
      LIMIT ?`
-  ).all(currentSessionName, limit);
-
-  // Broadcast messages (not from me, not yet delivered to me)
-  const broadcastMessages = db.query<MessageRow, [string, string, number]>(
-    `SELECT m.* FROM messages m
-     WHERE m."to" = '*'
-       AND m."from" != ?
-       AND m.id NOT IN (SELECT message_id FROM broadcast_deliveries WHERE session_name = ?)
-     ORDER BY m.timestamp ASC
-     LIMIT ?`
-  ).all(currentSessionName, currentSessionName, limit);
-
-  // Merge and sort by timestamp, apply overall limit
-  const allMessages = [...directMessages, ...broadcastMessages]
-    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-    .slice(0, limit);
+  ).all(currentSessionName, currentSessionName, currentSessionName, limit);
 
   // Mark direct messages as delivered
   for (const msg of allMessages) {
