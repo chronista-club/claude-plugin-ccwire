@@ -2,68 +2,72 @@
 # ccwire: Check for pending messages (read-only, does not mark as delivered)
 # Used by UserPromptSubmit hook to show unread notifications
 
-CCWIRE_DIR="$HOME/.cache/ccwire/messages"
+DB_PATH="$HOME/.cache/ccwire/ccwire.db"
 SESSION_NAME="${CCWIRE_SESSION_NAME:-}"
 
-if [ ! -d "$CCWIRE_DIR" ]; then
+if [ ! -f "$DB_PATH" ]; then
   echo '{}'
   exit 0
 fi
 
-# Early return: check if any JSON files exist at all
-shopt -s nullglob
-all_json=("$CCWIRE_DIR"/*/*.json)
-shopt -u nullglob
-if [ ${#all_json[@]} -eq 0 ]; then
+# Direct messages (pending, addressed to me or no session name)
+if [ -n "$SESSION_NAME" ]; then
+  DIRECT=$(sqlite3 -separator '|' "$DB_PATH" "
+    SELECT \"from\", \"to\", substr(content, 1, 120)
+    FROM messages
+    WHERE \"to\" = '$SESSION_NAME' AND status = 'pending'
+    ORDER BY timestamp ASC;
+  " 2>/dev/null)
+
+  # Broadcast messages (not from me, not yet delivered to me)
+  BROADCAST=$(sqlite3 -separator '|' "$DB_PATH" "
+    SELECT m.\"from\", 'broadcast', substr(m.content, 1, 120)
+    FROM messages m
+    WHERE m.\"to\" = '*'
+      AND m.\"from\" != '$SESSION_NAME'
+      AND m.id NOT IN (SELECT message_id FROM broadcast_deliveries WHERE session_name = '$SESSION_NAME')
+    ORDER BY m.timestamp ASC;
+  " 2>/dev/null)
+else
+  # No session name: show all pending messages
+  DIRECT=$(sqlite3 -separator '|' "$DB_PATH" "
+    SELECT \"from\", \"to\", substr(content, 1, 120)
+    FROM messages
+    WHERE status = 'pending' AND \"to\" != '*'
+    ORDER BY timestamp ASC;
+  " 2>/dev/null)
+
+  BROADCAST=$(sqlite3 -separator '|' "$DB_PATH" "
+    SELECT \"from\", 'broadcast', substr(content, 1, 120)
+    FROM messages
+    WHERE \"to\" = '*' AND status = 'pending'
+    ORDER BY timestamp ASC;
+  " 2>/dev/null)
+fi
+
+# Combine results
+ALL_MESSAGES="${DIRECT}
+${BROADCAST}"
+ALL_MESSAGES=$(echo "$ALL_MESSAGES" | sed '/^$/d')
+
+if [ -z "$ALL_MESSAGES" ]; then
   echo '{}'
   exit 0
 fi
 
-messages=""
 count=0
+messages=""
 
-for dir in "$CCWIRE_DIR"/*/; do
-  [ -d "$dir" ] || continue
-  for file in "$dir"*.json; do
-    [ -f "$file" ] || continue
-
-    # Single jq call to extract all needed fields at once
-    read -r status from to content < <(jq -r '[.status // "", .from // "?", .to // "?", (.content // "" | .[0:120])] | @tsv' "$file" 2>/dev/null)
-
-    if [ "$to" = "*" ]; then
-      # Broadcast: check per-session delivered_to array
-      if [ -n "$SESSION_NAME" ]; then
-        # Skip if we sent it
-        if [ "$from" = "$SESSION_NAME" ]; then
-          continue
-        fi
-        # Single jq call to check delivered_to for this session
-        already_delivered=$(jq -r --arg s "$SESSION_NAME" '.delivered_to // [] | index($s) // empty' "$file" 2>/dev/null)
-        if [ -n "$already_delivered" ]; then
-          continue
-        fi
-      else
-        # No session name: fall back to status check
-        if [ "$status" != "pending" ]; then
-          continue
-        fi
-      fi
-      messages="${messages}- [${from} → broadcast]: ${content}\n"
-      count=$((count + 1))
-    else
-      # Direct message: standard status check
-      if [ "$status" = "pending" ]; then
-        messages="${messages}- [${from} → ${to}]: ${content}\n"
-        count=$((count + 1))
-      fi
-    fi
-  done
-done
+while IFS='|' read -r from to content; do
+  [ -z "$from" ] && continue
+  messages="${messages}- [${from} → ${to}]: ${content}\\n"
+  count=$((count + 1))
+done <<< "$ALL_MESSAGES"
 
 if [ "$count" -gt 0 ]; then
   # Escape for JSON
-  escaped=$(printf '%s' "$messages" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | tr '\n' ' ')
-  echo "{\"additionalContext\": \"## ccwire: 未読メッセージ ${count}件\n${escaped}\"}"
+  escaped=$(printf '%s' "$messages" | sed 's/"/\\"/g; s/\t/\\t/g')
+  echo "{\"additionalContext\": \"## ccwire: 未読メッセージ ${count}件\\n${escaped}\"}"
 else
   echo '{}'
 fi
