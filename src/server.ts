@@ -47,6 +47,7 @@ interface Message {
   timestamp: string;
   reply_to: string | null;
   status: "pending" | "delivered" | "acknowledged";
+  delivered_to?: string[];
 }
 
 // ─────────────────────────────────────────────
@@ -133,7 +134,7 @@ async function readMessages(sessionName: string, limit: number): Promise<Message
     }
   } catch {}
 
-  // Read broadcast messages
+  // Read broadcast messages (per-session delivery tracking)
   const broadcastDir = join(MESSAGES_DIR, "broadcast");
   try {
     const files = await readdir(broadcastDir);
@@ -141,7 +142,7 @@ async function readMessages(sessionName: string, limit: number): Promise<Message
       if (!file.endsWith(".json")) continue;
       const data = await readFile(join(broadcastDir, file), "utf-8");
       const msg: Message = JSON.parse(data);
-      if (msg.status === "pending" && msg.from !== sessionName) {
+      if (msg.from !== sessionName && !(msg.delivered_to?.includes(sessionName))) {
         messages.push(msg);
       }
     }
@@ -153,8 +154,23 @@ async function readMessages(sessionName: string, limit: number): Promise<Message
   return messages.slice(0, limit);
 }
 
-async function markMessageDelivered(msg: Message): Promise<void> {
-  msg.status = "delivered";
+async function markMessageDelivered(msg: Message, sessionName: string): Promise<void> {
+  if (msg.to === "*") {
+    // Broadcast: per-session delivery tracking
+    if (!msg.delivered_to) msg.delivered_to = [];
+    if (!msg.delivered_to.includes(sessionName)) {
+      msg.delivered_to.push(sessionName);
+    }
+    // Mark as fully delivered only when all active sessions have received it
+    const sessions = cleanStaleSessions(await readSessions());
+    const recipients = Object.keys(sessions).filter(n => n !== msg.from);
+    if (recipients.length > 0 && recipients.every(n => msg.delivered_to!.includes(n))) {
+      msg.status = "delivered";
+    }
+  } else {
+    // Direct message: immediate delivery
+    msg.status = "delivered";
+  }
   const dir = msg.to === "*"
     ? join(MESSAGES_DIR, "broadcast")
     : join(MESSAGES_DIR, msg.to);
@@ -286,6 +302,48 @@ function cleanStaleSessions(sessions: Sessions): Sessions {
       cleaned[name] = session;
     }
   }
+  return cleaned;
+}
+
+// Message TTL: same as session TTL
+const MESSAGE_TTL_MS = SESSION_TTL_MS;
+
+async function cleanStaleMessages(): Promise<number> {
+  const now = Date.now();
+  let cleaned = 0;
+
+  try {
+    const dirs = await readdir(MESSAGES_DIR);
+    for (const dir of dirs) {
+      const dirPath = join(MESSAGES_DIR, dir);
+      try {
+        const files = await readdir(dirPath);
+        for (const file of files) {
+          if (!file.endsWith(".json")) continue;
+          try {
+            const filePath = join(dirPath, file);
+            const data = await readFile(filePath, "utf-8");
+            const msg: Message = JSON.parse(data);
+            const age = now - new Date(msg.timestamp).getTime();
+
+            // Delete delivered/acknowledged messages older than TTL
+            if (age > MESSAGE_TTL_MS && msg.status !== "pending") {
+              await unlink(filePath);
+              cleaned++;
+              continue;
+            }
+
+            // For broadcast: delete if fully delivered and older than TTL
+            if (dir === "broadcast" && age > MESSAGE_TTL_MS && msg.delivered_to && msg.delivered_to.length > 0) {
+              await unlink(filePath);
+              cleaned++;
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+  } catch {}
+
   return cleaned;
 }
 
@@ -459,9 +517,9 @@ server.registerTool("wire_receive", {
 
     const messages = await readMessages(currentSessionName!, limit);
 
-    // Mark as delivered
+    // Mark as delivered (with per-session tracking for broadcasts)
     for (const msg of messages) {
-      await markMessageDelivered(msg);
+      await markMessageDelivered(msg, currentSessionName!);
     }
 
     if (messages.length === 0) {
@@ -557,6 +615,9 @@ server.registerTool("wire_sessions", {
 
   const sessions = cleanStaleSessions(await readSessions());
 
+  // Opportunistic message cleanup
+  const cleanedMsgs = await cleanStaleMessages();
+
   if (Object.keys(sessions).length === 0) {
     return {
       content: [{ type: "text" as const, text: "登録されたセッションはありません。" }],
@@ -569,10 +630,12 @@ server.registerTool("wire_sessions", {
     return `  ${s.name}${isSelf} - ${s.status}${tmux} (last: ${s.last_seen})`;
   });
 
+  const cleanInfo = cleanedMsgs > 0 ? `\n(${cleanedMsgs} 件の古いメッセージを削除)` : "";
+
   return {
     content: [{
       type: "text" as const,
-      text: `接続セッション (${Object.keys(sessions).length}):\n${lines.join("\n")}`,
+      text: `接続セッション (${Object.keys(sessions).length}):\n${lines.join("\n")}${cleanInfo}`,
     }],
   };
 });

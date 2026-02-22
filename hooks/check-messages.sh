@@ -3,6 +3,7 @@
 # Used by UserPromptSubmit hook to show unread notifications
 
 CCWIRE_DIR="$HOME/.cache/ccwire/messages"
+SESSION_NAME="${CCWIRE_SESSION_NAME:-}"
 
 if [ ! -d "$CCWIRE_DIR" ]; then
   echo '{}'
@@ -17,15 +18,36 @@ for dir in "$CCWIRE_DIR"/*/; do
   for file in "$dir"*.json; do
     [ -f "$file" ] || continue
     status=$(jq -r '.status // empty' "$file" 2>/dev/null)
-    if [ "$status" = "pending" ]; then
-      from=$(jq -r '.from // "?"' "$file" 2>/dev/null)
-      to=$(jq -r '.to // "?"' "$file" 2>/dev/null)
-      content=$(jq -r '.content // ""' "$file" 2>/dev/null | head -c 120)
-      if [ "$to" = "*" ]; then
-        to="broadcast"
+    from=$(jq -r '.from // "?"' "$file" 2>/dev/null)
+    to=$(jq -r '.to // "?"' "$file" 2>/dev/null)
+
+    if [ "$to" = "*" ]; then
+      # Broadcast: check per-session delivered_to array
+      if [ -n "$SESSION_NAME" ]; then
+        # Skip if this session already received it, or if we sent it
+        if [ "$from" = "$SESSION_NAME" ]; then
+          continue
+        fi
+        already_delivered=$(jq -r --arg s "$SESSION_NAME" '.delivered_to // [] | index($s) // empty' "$file" 2>/dev/null)
+        if [ -n "$already_delivered" ]; then
+          continue
+        fi
+      else
+        # No session name: fall back to status check
+        if [ "$status" != "pending" ]; then
+          continue
+        fi
       fi
-      messages="${messages}- [${from} → ${to}]: ${content}\n"
+      content=$(jq -r '.content // ""' "$file" 2>/dev/null | head -c 120)
+      messages="${messages}- [${from} → broadcast]: ${content}\n"
       count=$((count + 1))
+    else
+      # Direct message: standard status check
+      if [ "$status" = "pending" ]; then
+        content=$(jq -r '.content // ""' "$file" 2>/dev/null | head -c 120)
+        messages="${messages}- [${from} → ${to}]: ${content}\n"
+        count=$((count + 1))
+      fi
     fi
   done
 done
