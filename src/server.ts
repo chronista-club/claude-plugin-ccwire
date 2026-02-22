@@ -1,10 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { mkdir, readFile, writeFile, readdir, unlink, stat, rmdir, appendFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
+import { Database } from "bun:sqlite";
 
 // ─────────────────────────────────────────────
 // Constants
@@ -15,10 +16,7 @@ const STORE_DIR = join(
   ".cache",
   "ccwire"
 );
-const SESSIONS_FILE = join(STORE_DIR, "sessions.json");
-const MESSAGES_DIR = join(STORE_DIR, "messages");
-const LOCK_FILE = join(STORE_DIR, "lock");
-const AUDIT_LOG_FILE = join(STORE_DIR, "audit.jsonl");
+const DB_PATH = join(STORE_DIR, "ccwire.db");
 
 // Session TTL: 24 hours
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
@@ -29,332 +27,107 @@ const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 interface Session {
   name: string;
-  tmux_target?: string;
+  tmux_target: string | null;
   status: "idle" | "busy" | "done";
   registered_at: string;
   last_seen: string;
 }
 
-interface Sessions {
-  [name: string]: Session;
-}
-
-interface Message {
+interface MessageRow {
   id: string;
   from: string;
   to: string;
-  type: "task_request" | "response" | "broadcast" | "ack" | "status_update" | "question" | "health_ping" | "conflict_warning";
+  type: string;
   content: string;
   timestamp: string;
   reply_to: string | null;
-  status: "pending" | "delivered" | "acknowledged";
-  delivered_to?: string[];
+  status: string;
 }
 
 // ─────────────────────────────────────────────
-// File-based store helpers
+// Database
 // ─────────────────────────────────────────────
 
-async function ensureStore(): Promise<void> {
-  await mkdir(STORE_DIR, { recursive: true });
-  await mkdir(MESSAGES_DIR, { recursive: true });
-}
+let db: Database;
 
-async function withFileLock<T>(fn: () => Promise<T>): Promise<T> {
-  const lockDir = LOCK_FILE;
-  const maxRetries = 50;
-  const retryDelay = 100;
+function initDb(): void {
+  db = new Database(DB_PATH);
+  db.run("PRAGMA journal_mode = WAL");
 
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      await mkdir(lockDir, { recursive: false });
-      try {
-        return await fn();
-      } finally {
-        await rmdir(lockDir).catch(() => {});
-      }
-    } catch (e: any) {
-      if (e.code === "EEXIST") {
-        try {
-          const lockStat = await stat(lockDir);
-          if (Date.now() - lockStat.mtimeMs > 10_000) {
-            await rmdir(lockDir).catch(() => {});
-            continue;
-          }
-        } catch {}
-        await Bun.sleep(retryDelay);
-        continue;
-      }
-      throw e;
-    }
-  }
-  throw new Error("Could not acquire file lock");
-}
+  db.run(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      name TEXT PRIMARY KEY,
+      tmux_target TEXT,
+      status TEXT NOT NULL DEFAULT 'idle' CHECK(status IN ('idle', 'busy', 'done')),
+      registered_at TEXT NOT NULL,
+      last_seen TEXT NOT NULL
+    )
+  `);
 
-async function readSessions(): Promise<Sessions> {
-  try {
-    const data = await readFile(SESSIONS_FILE, "utf-8");
-    return JSON.parse(data);
-  } catch {
-    return {};
-  }
-}
+  db.run(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      "from" TEXT NOT NULL,
+      "to" TEXT NOT NULL,
+      type TEXT NOT NULL,
+      content TEXT NOT NULL,
+      timestamp TEXT NOT NULL,
+      reply_to TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'delivered', 'acknowledged'))
+    )
+  `);
 
-async function writeSessions(sessions: Sessions): Promise<void> {
-  await writeFile(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
-}
+  db.run(`
+    CREATE TABLE IF NOT EXISTS broadcast_deliveries (
+      message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+      session_name TEXT NOT NULL,
+      PRIMARY KEY (message_id, session_name)
+    )
+  `);
 
-async function ensureSessionDir(name: string): Promise<string> {
-  const dir = join(MESSAGES_DIR, name);
-  await mkdir(dir, { recursive: true });
-  return dir;
-}
+  db.run(`
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      action TEXT NOT NULL,
+      session TEXT,
+      details TEXT NOT NULL,
+      timestamp TEXT NOT NULL
+    )
+  `);
 
-async function writeMessage(msg: Message): Promise<void> {
-  const dir = msg.to === "*"
-    ? join(MESSAGES_DIR, "broadcast")
-    : join(MESSAGES_DIR, msg.to);
-  await mkdir(dir, { recursive: true });
-  await writeFile(join(dir, `${msg.id}.json`), JSON.stringify(msg, null, 2));
-}
-
-async function readMessages(sessionName: string, limit: number): Promise<Message[]> {
-  const messages: Message[] = [];
-
-  // Read direct messages
-  const directDir = join(MESSAGES_DIR, sessionName);
-  try {
-    const files = await readdir(directDir);
-    for (const file of files) {
-      if (!file.endsWith(".json")) continue;
-      const data = await readFile(join(directDir, file), "utf-8");
-      const msg: Message = JSON.parse(data);
-      if (msg.status === "pending") {
-        messages.push(msg);
-      }
-    }
-  } catch {}
-
-  // Read broadcast messages (per-session delivery tracking)
-  const broadcastDir = join(MESSAGES_DIR, "broadcast");
-  try {
-    const files = await readdir(broadcastDir);
-    for (const file of files) {
-      if (!file.endsWith(".json")) continue;
-      const data = await readFile(join(broadcastDir, file), "utf-8");
-      const msg: Message = JSON.parse(data);
-      if (msg.from !== sessionName && !(msg.delivered_to?.includes(sessionName))) {
-        messages.push(msg);
-      }
-    }
-  } catch {}
-
-  // Sort by timestamp (oldest first)
-  messages.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-  return messages.slice(0, limit);
-}
-
-async function markMessageDelivered(msg: Message, sessionName: string): Promise<void> {
-  if (msg.to === "*") {
-    // Broadcast: per-session delivery tracking
-    if (!msg.delivered_to) msg.delivered_to = [];
-    if (!msg.delivered_to.includes(sessionName)) {
-      msg.delivered_to.push(sessionName);
-    }
-    // Mark as fully delivered only when all active sessions have received it
-    const sessions = cleanStaleSessions(await readSessions());
-    const recipients = Object.keys(sessions).filter(n => n !== msg.from);
-    if (recipients.length > 0 && recipients.every(n => msg.delivered_to!.includes(n))) {
-      msg.status = "delivered";
-    }
-  } else {
-    // Direct message: immediate delivery
-    msg.status = "delivered";
-  }
-  const dir = msg.to === "*"
-    ? join(MESSAGES_DIR, "broadcast")
-    : join(MESSAGES_DIR, msg.to);
-  await writeFile(join(dir, `${msg.id}.json`), JSON.stringify(msg, null, 2));
-}
-
-async function acknowledgeMessage(messageId: string, sessionName: string): Promise<boolean> {
-  // Search in session's direct messages
-  const directDir = join(MESSAGES_DIR, sessionName);
-  try {
-    const filePath = join(directDir, `${messageId}.json`);
-    const data = await readFile(filePath, "utf-8");
-    const msg: Message = JSON.parse(data);
-    msg.status = "acknowledged";
-    await writeFile(filePath, JSON.stringify(msg, null, 2));
-    return true;
-  } catch {}
-
-  // Search in broadcast
-  const broadcastDir = join(MESSAGES_DIR, "broadcast");
-  try {
-    const filePath = join(broadcastDir, `${messageId}.json`);
-    const data = await readFile(filePath, "utf-8");
-    const msg: Message = JSON.parse(data);
-    msg.status = "acknowledged";
-    await writeFile(filePath, JSON.stringify(msg, null, 2));
-    return true;
-  } catch {}
-
-  return false;
-}
-
-async function findMessageById(messageId: string): Promise<Message | null> {
-  try {
-    const dirs = await readdir(MESSAGES_DIR);
-    for (const dir of dirs) {
-      const filePath = join(MESSAGES_DIR, dir, `${messageId}.json`);
-      try {
-        const data = await readFile(filePath, "utf-8");
-        return JSON.parse(data);
-      } catch {}
-    }
-  } catch {}
-  return null;
-}
-
-async function getAllMessages(): Promise<Message[]> {
-  const messages: Message[] = [];
-  try {
-    const dirs = await readdir(MESSAGES_DIR);
-    for (const dir of dirs) {
-      const dirPath = join(MESSAGES_DIR, dir);
-      try {
-        const files = await readdir(dirPath);
-        for (const file of files) {
-          if (!file.endsWith(".json")) continue;
-          try {
-            const data = await readFile(join(dirPath, file), "utf-8");
-            messages.push(JSON.parse(data));
-          } catch {}
-        }
-      } catch {}
-    }
-  } catch {}
-  return messages;
-}
-
-async function buildThread(messageId: string): Promise<Message[]> {
-  const allMessages = await getAllMessages();
-  const byId = new Map(allMessages.map((m) => [m.id, m]));
-
-  // Trace back to the root of the thread
-  let rootId = messageId;
-  const visited = new Set<string>();
-  while (true) {
-    if (visited.has(rootId)) break;
-    visited.add(rootId);
-    const msg = byId.get(rootId);
-    if (!msg || !msg.reply_to) break;
-    rootId = msg.reply_to;
-  }
-
-  // Collect all messages in the thread (forward from root)
-  const thread: Message[] = [];
-  const childrenMap = new Map<string, string[]>();
-
-  // Build parent → children mapping
-  for (const msg of allMessages) {
-    if (msg.reply_to) {
-      const children = childrenMap.get(msg.reply_to) ?? [];
-      children.push(msg.id);
-      childrenMap.set(msg.reply_to, children);
-    }
-  }
-
-  // Walk the chain from root
-  const queue = [rootId];
-  const seen = new Set<string>();
-  while (queue.length > 0) {
-    const id = queue.shift()!;
-    if (seen.has(id)) continue;
-    seen.add(id);
-    const msg = byId.get(id);
-    if (msg) {
-      thread.push(msg);
-      const children = childrenMap.get(id) ?? [];
-      // Sort children by timestamp
-      children.sort((a, b) => {
-        const ma = byId.get(a);
-        const mb = byId.get(b);
-        if (!ma || !mb) return 0;
-        return new Date(ma.timestamp).getTime() - new Date(mb.timestamp).getTime();
-      });
-      queue.push(...children);
-    }
-  }
-
-  // Sort by timestamp
-  thread.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-  return thread;
-}
-
-function cleanStaleSessions(sessions: Sessions): Sessions {
-  const now = Date.now();
-  const cleaned: Sessions = {};
-  for (const [name, session] of Object.entries(sessions)) {
-    if (now - new Date(session.last_seen).getTime() < SESSION_TTL_MS) {
-      cleaned[name] = session;
-    }
-  }
-  return cleaned;
-}
-
-// Message TTL: same as session TTL
-const MESSAGE_TTL_MS = SESSION_TTL_MS;
-
-async function cleanStaleMessages(): Promise<number> {
-  const now = Date.now();
-  let cleaned = 0;
-
-  try {
-    const dirs = await readdir(MESSAGES_DIR);
-    for (const dir of dirs) {
-      const dirPath = join(MESSAGES_DIR, dir);
-      try {
-        const files = await readdir(dirPath);
-        for (const file of files) {
-          if (!file.endsWith(".json")) continue;
-          try {
-            const filePath = join(dirPath, file);
-            const data = await readFile(filePath, "utf-8");
-            const msg: Message = JSON.parse(data);
-            const age = now - new Date(msg.timestamp).getTime();
-
-            // Delete delivered/acknowledged messages older than TTL
-            if (age > MESSAGE_TTL_MS && msg.status !== "pending") {
-              await unlink(filePath);
-              cleaned++;
-              continue;
-            }
-
-            // For broadcast: delete if fully delivered and older than TTL
-            if (dir === "broadcast" && age > MESSAGE_TTL_MS && msg.delivered_to && msg.delivered_to.length > 0) {
-              await unlink(filePath);
-              cleaned++;
-            }
-          } catch {}
-        }
-      } catch {}
-    }
-  } catch {}
-
-  return cleaned;
+  db.run(`CREATE INDEX IF NOT EXISTS idx_messages_to_status ON messages("to", status)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)`);
 }
 
 // ─────────────────────────────────────────────
-// Audit log
+// DB helpers
 // ─────────────────────────────────────────────
 
-async function appendAuditLog(entry: { action: string; session: string | null; details: Record<string, unknown> }): Promise<void> {
-  const line = JSON.stringify({ ...entry, timestamp: new Date().toISOString() }) + "\n";
-  await appendFile(AUDIT_LOG_FILE, line);
+function auditLog(action: string, session: string | null, details: Record<string, unknown>): void {
+  db.run(
+    `INSERT INTO audit_log (action, session, details, timestamp) VALUES (?, ?, ?, ?)`,
+    [action, session, JSON.stringify(details), new Date().toISOString()]
+  );
+}
+
+function cleanStaleSessions(): void {
+  const cutoff = new Date(Date.now() - SESSION_TTL_MS).toISOString();
+  db.run(`DELETE FROM sessions WHERE last_seen < ?`, [cutoff]);
+}
+
+function cleanStaleMessages(): number {
+  const cutoff = new Date(Date.now() - SESSION_TTL_MS).toISOString();
+  // Delete non-pending messages older than TTL
+  const result = db.run(
+    `DELETE FROM messages WHERE timestamp < ? AND status != 'pending'`,
+    [cutoff]
+  );
+  return result.changes;
+}
+
+function touchSession(name: string): void {
+  db.run(`UPDATE sessions SET last_seen = ? WHERE name = ?`, [new Date().toISOString(), name]);
 }
 
 // ─────────────────────────────────────────────
@@ -368,9 +141,7 @@ function execTmux(...args: string[]): Promise<void> {
 }
 
 async function notifyViaTmux(tmuxTarget: string, message: string): Promise<void> {
-  // Send text first
   await execTmux("send-keys", "-t", tmuxTarget, message);
-  // Wait then send Enter separately
   await Bun.sleep(500);
   await execTmux("send-keys", "-t", tmuxTarget, "Enter");
 }
@@ -400,10 +171,8 @@ server.registerTool("wire_register", {
     tmux_target: z.string().optional().describe("tmuxターゲット（例: 'session:window.pane'）。省略可。"),
   },
 }, async ({ name, tmux_target }) => {
-  await ensureStore();
-
   // tmux_target のバリデーション（指定時のみ）
-  let validatedTmuxTarget = tmux_target;
+  let validatedTmuxTarget = tmux_target ?? null;
   let tmuxWarning: string | null = null;
 
   if (tmux_target) {
@@ -416,42 +185,36 @@ server.registerTool("wire_register", {
       });
     } catch {
       tmuxWarning = `警告: tmux_target "${tmux_target}" のペインが見つかりません。通知機能は無効です。`;
-      validatedTmuxTarget = undefined;
+      validatedTmuxTarget = null;
     }
   }
 
-  return await withFileLock(async () => {
-    const sessions = cleanStaleSessions(await readSessions());
+  cleanStaleSessions();
 
-    const now = new Date().toISOString();
-    sessions[name] = {
-      name,
-      tmux_target: validatedTmuxTarget,
-      status: "idle",
-      registered_at: sessions[name]?.registered_at ?? now,
-      last_seen: now,
-    };
+  const now = new Date().toISOString();
+  const existing = db.query<{ registered_at: string }, [string]>(
+    `SELECT registered_at FROM sessions WHERE name = ?`
+  ).get(name);
 
-    await writeSessions(sessions);
-    await ensureSessionDir(name);
+  db.run(
+    `INSERT OR REPLACE INTO sessions (name, tmux_target, status, registered_at, last_seen)
+     VALUES (?, ?, 'idle', ?, ?)`,
+    [name, validatedTmuxTarget, existing?.registered_at ?? now, now]
+  );
 
-    currentSessionName = name;
+  currentSessionName = name;
 
-    await appendAuditLog({ action: "register", session: name, details: { tmux_target: validatedTmuxTarget ?? null } });
+  auditLog("register", name, { tmux_target: validatedTmuxTarget });
 
-    const message = tmuxWarning
-      ? `セッション "${name}" を登録しました。\n\n${tmuxWarning}\n\n現在の接続セッション数: ${Object.keys(sessions).length}`
-      : `セッション "${name}" を登録しました。\n\n現在の接続セッション数: ${Object.keys(sessions).length}`;
+  const count = db.query<{ cnt: number }, []>(`SELECT COUNT(*) as cnt FROM sessions`).get()!.cnt;
 
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: message,
-        },
-      ],
-    };
-  });
+  const message = tmuxWarning
+    ? `セッション "${name}" を登録しました。\n\n${tmuxWarning}\n\n現在の接続セッション数: ${count}`
+    : `セッション "${name}" を登録しました。\n\n現在の接続セッション数: ${count}`;
+
+  return {
+    content: [{ type: "text" as const, text: message }],
+  };
 });
 
 // ── wire_send ───────────────────────────────
@@ -473,56 +236,42 @@ server.registerTool("wire_send", {
     };
   }
 
-  await ensureStore();
+  cleanStaleSessions();
 
-  return await withFileLock(async () => {
-    const sessions = cleanStaleSessions(await readSessions());
-
-    if (!sessions[to]) {
-      const available = Object.keys(sessions).join(", ");
-      return {
-        content: [{ type: "text" as const, text: `エラー: セッション "${to}" が見つかりません。\n利用可能: ${available || "(なし)"}` }],
-        isError: true,
-      };
-    }
-
-    // Update last_seen
-    if (sessions[currentSessionName]) {
-      sessions[currentSessionName].last_seen = new Date().toISOString();
-      await writeSessions(sessions);
-    }
-
-    const msg: Message = {
-      id: `msg-${randomUUID()}`,
-      from: currentSessionName,
-      to,
-      type: type as Message["type"],
-      content,
-      timestamp: new Date().toISOString(),
-      reply_to: reply_to ?? null,
-      status: "pending",
-    };
-
-    await writeMessage(msg);
-
-    // Auto-notify via tmux if target has tmux_target
-    const targetSession = sessions[to];
-    if (targetSession?.tmux_target) {
-      await notifyViaTmux(
-        targetSession.tmux_target,
-        `wire_receiveで未読メッセージを確認して`
-      );
-    }
-
-    await appendAuditLog({ action: "send", session: currentSessionName, details: { to, type, message_id: msg.id } });
-
+  const target = db.query<Session, [string]>(`SELECT * FROM sessions WHERE name = ?`).get(to);
+  if (!target) {
+    const rows = db.query<{ name: string }, []>(`SELECT name FROM sessions`).all();
+    const available = rows.map(r => r.name).join(", ");
     return {
-      content: [{
-        type: "text" as const,
-        text: `メッセージ送信完了\n  ID: ${msg.id}\n  To: ${to}\n  Type: ${type}`,
-      }],
+      content: [{ type: "text" as const, text: `エラー: セッション "${to}" が見つかりません。\n利用可能: ${available || "(なし)"}` }],
+      isError: true,
     };
-  });
+  }
+
+  touchSession(currentSessionName);
+
+  const msgId = `msg-${randomUUID()}`;
+  const now = new Date().toISOString();
+
+  db.run(
+    `INSERT INTO messages (id, "from", "to", type, content, timestamp, reply_to, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+    [msgId, currentSessionName, to, type, content, now, reply_to ?? null]
+  );
+
+  // Auto-notify via tmux
+  if (target.tmux_target) {
+    await notifyViaTmux(target.tmux_target, `wire_receiveで未読メッセージを確認して`);
+  }
+
+  auditLog("send", currentSessionName, { to, type, message_id: msgId });
+
+  return {
+    content: [{
+      type: "text" as const,
+      text: `メッセージ送信完了\n  ID: ${msgId}\n  To: ${to}\n  Type: ${type}`,
+    }],
+  };
 });
 
 // ── wire_receive ────────────────────────────
@@ -541,43 +290,64 @@ server.registerTool("wire_receive", {
     };
   }
 
-  await ensureStore();
+  touchSession(currentSessionName);
 
-  return await withFileLock(async () => {
-    // Update last_seen
-    const sessions = await readSessions();
-    if (sessions[currentSessionName!]) {
-      sessions[currentSessionName!].last_seen = new Date().toISOString();
-      await writeSessions(sessions);
+  // Direct messages (pending, addressed to me)
+  const directMessages = db.query<MessageRow, [string, number]>(
+    `SELECT * FROM messages
+     WHERE "to" = ? AND status = 'pending'
+     ORDER BY timestamp ASC
+     LIMIT ?`
+  ).all(currentSessionName, limit);
+
+  // Broadcast messages (not from me, not yet delivered to me)
+  const broadcastMessages = db.query<MessageRow, [string, string, number]>(
+    `SELECT m.* FROM messages m
+     WHERE m."to" = '*'
+       AND m."from" != ?
+       AND m.id NOT IN (SELECT message_id FROM broadcast_deliveries WHERE session_name = ?)
+     ORDER BY m.timestamp ASC
+     LIMIT ?`
+  ).all(currentSessionName, currentSessionName, limit);
+
+  // Merge and sort by timestamp, apply overall limit
+  const allMessages = [...directMessages, ...broadcastMessages]
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+    .slice(0, limit);
+
+  // Mark direct messages as delivered
+  for (const msg of allMessages) {
+    if (msg.to === "*") {
+      // Broadcast: record per-session delivery
+      db.run(
+        `INSERT OR IGNORE INTO broadcast_deliveries (message_id, session_name) VALUES (?, ?)`,
+        [msg.id, currentSessionName]
+      );
+    } else {
+      // Direct: mark as delivered
+      db.run(`UPDATE messages SET status = 'delivered' WHERE id = ?`, [msg.id]);
     }
+  }
 
-    const messages = await readMessages(currentSessionName!, limit);
+  auditLog("receive", currentSessionName, { count: allMessages.length });
 
-    // Mark as delivered (with per-session tracking for broadcasts)
-    for (const msg of messages) {
-      await markMessageDelivered(msg, currentSessionName!);
-    }
-
-    await appendAuditLog({ action: "receive", session: currentSessionName, details: { count: messages.length } });
-
-    if (messages.length === 0) {
-      return {
-        content: [{ type: "text" as const, text: "未読メッセージはありません。" }],
-      };
-    }
-
-    const formatted = messages.map((msg, i) => {
-      const replyInfo = msg.reply_to ? `  Reply-To: ${msg.reply_to}\n` : "";
-      return `[${i + 1}] ${msg.id}\n  From: ${msg.from}\n  Type: ${msg.type}\n  Time: ${msg.timestamp}\n${replyInfo}  Content: ${msg.content}`;
-    }).join("\n\n");
-
+  if (allMessages.length === 0) {
     return {
-      content: [{
-        type: "text" as const,
-        text: `未読メッセージ ${messages.length}件:\n\n${formatted}`,
-      }],
+      content: [{ type: "text" as const, text: "未読メッセージはありません。" }],
     };
-  });
+  }
+
+  const formatted = allMessages.map((msg, i) => {
+    const replyInfo = msg.reply_to ? `  Reply-To: ${msg.reply_to}\n` : "";
+    return `[${i + 1}] ${msg.id}\n  From: ${msg.from}\n  Type: ${msg.type}\n  Time: ${msg.timestamp}\n${replyInfo}  Content: ${msg.content}`;
+  }).join("\n\n");
+
+  return {
+    content: [{
+      type: "text" as const,
+      text: `未読メッセージ ${allMessages.length}件:\n\n${formatted}`,
+    }],
+  };
 });
 
 // ── wire_broadcast ──────────────────────────
@@ -596,52 +366,39 @@ server.registerTool("wire_broadcast", {
     };
   }
 
-  await ensureStore();
+  cleanStaleSessions();
+  touchSession(currentSessionName);
 
-  return await withFileLock(async () => {
-    const sessions = cleanStaleSessions(await readSessions());
+  const msgId = `msg-${randomUUID()}`;
+  const now = new Date().toISOString();
 
-    // Update last_seen
-    if (sessions[currentSessionName!]) {
-      sessions[currentSessionName!].last_seen = new Date().toISOString();
-      await writeSessions(sessions);
-    }
+  db.run(
+    `INSERT INTO messages (id, "from", "to", type, content, timestamp, reply_to, status)
+     VALUES (?, ?, '*', 'broadcast', ?, ?, NULL, 'pending')`,
+    [msgId, currentSessionName, content, now]
+  );
 
-    const msg: Message = {
-      id: `msg-${randomUUID()}`,
-      from: currentSessionName!,
-      to: "*",
-      type: "broadcast",
-      content,
-      timestamp: new Date().toISOString(),
-      reply_to: null,
-      status: "pending",
-    };
+  // Auto-notify all sessions with tmux_target
+  const recipients = db.query<Session, [string]>(
+    `SELECT * FROM sessions WHERE name != ? AND tmux_target IS NOT NULL`
+  ).all(currentSessionName);
 
-    await writeMessage(msg);
+  for (const s of recipients) {
+    await notifyViaTmux(s.tmux_target!, `wire_receiveで未読メッセージを確認して`);
+  }
 
-    // Auto-notify all sessions with tmux_target
-    const recipients = Object.values(sessions).filter(
-      (s) => s.name !== currentSessionName && s.tmux_target
-    );
-    for (const s of recipients) {
-      await notifyViaTmux(
-        s.tmux_target!,
-        `wire_receiveで未読メッセージを確認して`
-      );
-    }
+  const recipientCount = db.query<{ cnt: number }, [string]>(
+    `SELECT COUNT(*) as cnt FROM sessions WHERE name != ?`
+  ).get(currentSessionName)!.cnt;
 
-    const recipientCount = Object.keys(sessions).filter(n => n !== currentSessionName).length;
+  auditLog("broadcast", currentSessionName, { message_id: msgId, recipient_count: recipientCount });
 
-    await appendAuditLog({ action: "broadcast", session: currentSessionName, details: { message_id: msg.id, recipient_count: recipientCount } });
-
-    return {
-      content: [{
-        type: "text" as const,
-        text: `ブロードキャスト送信完了\n  ID: ${msg.id}\n  対象セッション数: ${recipientCount}`,
-      }],
-    };
-  });
+  return {
+    content: [{
+      type: "text" as const,
+      text: `ブロードキャスト送信完了\n  ID: ${msgId}\n  対象セッション数: ${recipientCount}`,
+    }],
+  };
 });
 
 // ── wire_sessions ───────────────────────────
@@ -651,20 +408,18 @@ server.registerTool("wire_sessions", {
   description: "接続中のセッション一覧を取得する。",
   inputSchema: {},
 }, async () => {
-  await ensureStore();
+  cleanStaleSessions();
+  const cleanedMsgs = cleanStaleMessages();
 
-  const sessions = cleanStaleSessions(await readSessions());
+  const sessions = db.query<Session, []>(`SELECT * FROM sessions`).all();
 
-  // Opportunistic message cleanup
-  const cleanedMsgs = await cleanStaleMessages();
-
-  if (Object.keys(sessions).length === 0) {
+  if (sessions.length === 0) {
     return {
       content: [{ type: "text" as const, text: "登録されたセッションはありません。" }],
     };
   }
 
-  const lines = Object.values(sessions).map((s) => {
+  const lines = sessions.map((s) => {
     const isSelf = s.name === currentSessionName ? " (自分)" : "";
     const tmux = s.tmux_target ? ` [tmux: ${s.tmux_target}]` : "";
     return `  ${s.name}${isSelf} - ${s.status}${tmux} (last: ${s.last_seen})`;
@@ -675,7 +430,7 @@ server.registerTool("wire_sessions", {
   return {
     content: [{
       type: "text" as const,
-      text: `接続セッション (${Object.keys(sessions).length}):\n${lines.join("\n")}${cleanInfo}`,
+      text: `接続セッション (${sessions.length}):\n${lines.join("\n")}${cleanInfo}`,
     }],
   };
 });
@@ -689,44 +444,50 @@ server.registerTool("wire_status", {
     status: z.enum(["idle", "busy", "done"]).optional().describe("設定するステータス。省略すると全体のステータスを取得。"),
   },
 }, async ({ status }) => {
-  await ensureStore();
+  cleanStaleSessions();
 
-  return await withFileLock(async () => {
-    const sessions = cleanStaleSessions(await readSessions());
-
-    if (status) {
-      if (!currentSessionName || !sessions[currentSessionName]) {
-        return {
-          content: [{ type: "text" as const, text: "エラー: まず wire_register でセッションを登録してください。" }],
-          isError: true,
-        };
-      }
-
-      sessions[currentSessionName].status = status;
-      sessions[currentSessionName].last_seen = new Date().toISOString();
-      await writeSessions(sessions);
-
+  if (status) {
+    if (!currentSessionName) {
       return {
-        content: [{
-          type: "text" as const,
-          text: `ステータスを "${status}" に更新しました。`,
-        }],
+        content: [{ type: "text" as const, text: "エラー: まず wire_register でセッションを登録してください。" }],
+        isError: true,
       };
     }
 
-    // Return all statuses
-    const lines = Object.values(sessions).map((s) => {
-      const isSelf = s.name === currentSessionName ? " ★" : "";
-      return `  ${s.name}: ${s.status}${isSelf}`;
-    });
+    const existing = db.query<Session, [string]>(`SELECT * FROM sessions WHERE name = ?`).get(currentSessionName);
+    if (!existing) {
+      return {
+        content: [{ type: "text" as const, text: "エラー: まず wire_register でセッションを登録してください。" }],
+        isError: true,
+      };
+    }
+
+    db.run(
+      `UPDATE sessions SET status = ?, last_seen = ? WHERE name = ?`,
+      [status, new Date().toISOString(), currentSessionName]
+    );
 
     return {
       content: [{
         type: "text" as const,
-        text: `全セッションステータス:\n${lines.join("\n")}`,
+        text: `ステータスを "${status}" に更新しました。`,
       }],
     };
+  }
+
+  // Return all statuses
+  const sessions = db.query<Session, []>(`SELECT * FROM sessions`).all();
+  const lines = sessions.map((s) => {
+    const isSelf = s.name === currentSessionName ? " ★" : "";
+    return `  ${s.name}: ${s.status}${isSelf}`;
   });
+
+  return {
+    content: [{
+      type: "text" as const,
+      text: `全セッションステータス:\n${lines.join("\n")}`,
+    }],
+  };
 });
 
 // ── wire_unregister ──────────────────────────
@@ -747,32 +508,28 @@ server.registerTool("wire_unregister", {
     };
   }
 
-  await ensureStore();
-
-  return await withFileLock(async () => {
-    const sessions = await readSessions();
-
-    if (!sessions[targetName]) {
-      return {
-        content: [{ type: "text" as const, text: `エラー: セッション "${targetName}" は登録されていません。` }],
-        isError: true,
-      };
-    }
-
-    delete sessions[targetName];
-    await writeSessions(sessions);
-
-    if (targetName === currentSessionName) {
-      currentSessionName = null;
-    }
-
+  const existing = db.query<Session, [string]>(`SELECT * FROM sessions WHERE name = ?`).get(targetName);
+  if (!existing) {
     return {
-      content: [{
-        type: "text" as const,
-        text: `セッション "${targetName}" の登録を解除しました。\n残りセッション数: ${Object.keys(sessions).length}`,
-      }],
+      content: [{ type: "text" as const, text: `エラー: セッション "${targetName}" は登録されていません。` }],
+      isError: true,
     };
-  });
+  }
+
+  db.run(`DELETE FROM sessions WHERE name = ?`, [targetName]);
+
+  if (targetName === currentSessionName) {
+    currentSessionName = null;
+  }
+
+  const remaining = db.query<{ cnt: number }, []>(`SELECT COUNT(*) as cnt FROM sessions`).get()!.cnt;
+
+  return {
+    content: [{
+      type: "text" as const,
+      text: `セッション "${targetName}" の登録を解除しました。\n残りセッション数: ${remaining}`,
+    }],
+  };
 });
 
 // ── wire_ack ────────────────────────────────
@@ -791,25 +548,22 @@ server.registerTool("wire_ack", {
     };
   }
 
-  await ensureStore();
-
-  return await withFileLock(async () => {
-    const found = await acknowledgeMessage(message_id, currentSessionName!);
-
-    if (!found) {
-      return {
-        content: [{ type: "text" as const, text: `エラー: メッセージ "${message_id}" が見つかりません。` }],
-        isError: true,
-      };
-    }
-
+  const msg = db.query<MessageRow, [string]>(`SELECT * FROM messages WHERE id = ?`).get(message_id);
+  if (!msg) {
     return {
-      content: [{
-        type: "text" as const,
-        text: `メッセージ "${message_id}" を確認済みにしました。`,
-      }],
+      content: [{ type: "text" as const, text: `エラー: メッセージ "${message_id}" が見つかりません。` }],
+      isError: true,
     };
-  });
+  }
+
+  db.run(`UPDATE messages SET status = 'acknowledged' WHERE id = ?`, [message_id]);
+
+  return {
+    content: [{
+      type: "text" as const,
+      text: `メッセージ "${message_id}" を確認済みにしました。`,
+    }],
+  };
 });
 
 // ── wire_thread ────────────────────────────────
@@ -821,9 +575,36 @@ server.registerTool("wire_thread", {
     message_id: z.string().describe("スレッド内の任意のメッセージID"),
   },
 }, async ({ message_id }) => {
-  await ensureStore();
+  // Find the root of the thread by tracing reply_to chain upward
+  const rootRow = db.query<{ id: string }, [string]>(`
+    WITH RECURSIVE ancestors(id, reply_to) AS (
+      SELECT id, reply_to FROM messages WHERE id = ?
+      UNION ALL
+      SELECT m.id, m.reply_to FROM messages m
+      JOIN ancestors a ON m.id = a.reply_to
+    )
+    SELECT id FROM ancestors WHERE reply_to IS NULL
+  `).get(message_id);
 
-  const thread = await buildThread(message_id);
+  if (!rootRow) {
+    return {
+      content: [{ type: "text" as const, text: `エラー: メッセージ "${message_id}" が見つからないか、スレッドを構築できません。` }],
+      isError: true,
+    };
+  }
+
+  // Collect all descendants from the root
+  const thread = db.query<MessageRow, [string]>(`
+    WITH RECURSIVE thread(id) AS (
+      SELECT id FROM messages WHERE id = ?
+      UNION ALL
+      SELECT m.id FROM messages m
+      JOIN thread t ON m.reply_to = t.id
+    )
+    SELECT msg.* FROM messages msg
+    JOIN thread t ON msg.id = t.id
+    ORDER BY msg.timestamp ASC
+  `).all(rootRow.id);
 
   if (thread.length === 0) {
     return {
@@ -847,12 +628,100 @@ server.registerTool("wire_thread", {
   };
 });
 
+// ── wire_control ────────────────────────────────
+
+server.registerTool("wire_control", {
+  title: "Wire Control",
+  description: "セッションの tmux ペインにキーストロークを送信する。止まっている worker を起こしたり、Permission prompt に応答したり、テキストを入力できる。",
+  inputSchema: {
+    session: z.string().describe("対象セッション名"),
+    action: z.enum(["enter", "accept", "reject", "interrupt", "text"])
+      .describe("アクション: enter=Enter送信, accept=y+Enter, reject=n+Enter, interrupt=Ctrl+C, text=テキスト入力+Enter"),
+    text: z.string().optional().describe("action='text' の場合に送信するテキスト"),
+  },
+}, async ({ session, action, text }) => {
+  cleanStaleSessions();
+
+  const target = db.query<Session, [string]>(`SELECT * FROM sessions WHERE name = ?`).get(session);
+
+  if (!target) {
+    const rows = db.query<{ name: string }, []>(`SELECT name FROM sessions`).all();
+    const available = rows.map(r => r.name).join(", ");
+    return {
+      content: [{ type: "text" as const, text: `エラー: セッション "${session}" が見つかりません。\n利用可能: ${available || "(なし)"}` }],
+      isError: true,
+    };
+  }
+
+  if (!target.tmux_target) {
+    return {
+      content: [{ type: "text" as const, text: `エラー: セッション "${session}" に tmux_target が設定されていません。wire_register で tmux_target を指定して再登録してください。` }],
+      isError: true,
+    };
+  }
+
+  if (action === "text" && !text) {
+    return {
+      content: [{ type: "text" as const, text: `エラー: action="text" の場合は text パラメータが必須です。` }],
+      isError: true,
+    };
+  }
+
+  const tmux = target.tmux_target;
+
+  switch (action) {
+    case "enter":
+      await execTmux("send-keys", "-t", tmux, "Enter");
+      break;
+    case "accept":
+      await execTmux("send-keys", "-t", tmux, "y");
+      await Bun.sleep(100);
+      await execTmux("send-keys", "-t", tmux, "Enter");
+      break;
+    case "reject":
+      await execTmux("send-keys", "-t", tmux, "n");
+      await Bun.sleep(100);
+      await execTmux("send-keys", "-t", tmux, "Enter");
+      break;
+    case "interrupt":
+      await execTmux("send-keys", "-t", tmux, "C-c");
+      break;
+    case "text":
+      await execTmux("send-keys", "-t", tmux, text!);
+      await Bun.sleep(100);
+      await execTmux("send-keys", "-t", tmux, "Enter");
+      break;
+  }
+
+  auditLog("control", currentSessionName, {
+    target_session: session,
+    control_action: action,
+    text: text ?? null,
+  });
+
+  const actionDesc: Record<string, string> = {
+    enter: "Enter キー送信",
+    accept: "承認 (y + Enter)",
+    reject: "拒否 (n + Enter)",
+    interrupt: "中断 (Ctrl+C)",
+    text: `テキスト入力: "${text}"`,
+  };
+
+  return {
+    content: [{
+      type: "text" as const,
+      text: `制御コマンド送信完了\n  対象: ${session} [${tmux}]\n  アクション: ${actionDesc[action]}`,
+    }],
+  };
+});
+
 // ─────────────────────────────────────────────
 // Start server
 // ─────────────────────────────────────────────
 
 async function main() {
-  await ensureStore();
+  await mkdir(STORE_DIR, { recursive: true });
+  initDb();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
