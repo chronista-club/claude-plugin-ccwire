@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { mkdir, readFile, writeFile, readdir, unlink, stat, rmdir } from "node:fs/promises";
+import { mkdir, readFile, writeFile, readdir, unlink, stat, rmdir, appendFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -18,6 +18,7 @@ const STORE_DIR = join(
 const SESSIONS_FILE = join(STORE_DIR, "sessions.json");
 const MESSAGES_DIR = join(STORE_DIR, "messages");
 const LOCK_FILE = join(STORE_DIR, "lock");
+const AUDIT_LOG_FILE = join(STORE_DIR, "audit.jsonl");
 
 // Session TTL: 24 hours
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
@@ -42,7 +43,7 @@ interface Message {
   id: string;
   from: string;
   to: string;
-  type: "task_request" | "response" | "broadcast" | "ack" | "status_update";
+  type: "task_request" | "response" | "broadcast" | "ack" | "status_update" | "question" | "health_ping" | "conflict_warning";
   content: string;
   timestamp: string;
   reply_to: string | null;
@@ -348,6 +349,15 @@ async function cleanStaleMessages(): Promise<number> {
 }
 
 // ─────────────────────────────────────────────
+// Audit log
+// ─────────────────────────────────────────────
+
+async function appendAuditLog(entry: { action: string; session: string | null; details: Record<string, unknown> }): Promise<void> {
+  const line = JSON.stringify({ ...entry, timestamp: new Date().toISOString() }) + "\n";
+  await appendFile(AUDIT_LOG_FILE, line);
+}
+
+// ─────────────────────────────────────────────
 // tmux notification helper
 // ─────────────────────────────────────────────
 
@@ -392,13 +402,31 @@ server.registerTool("wire_register", {
 }, async ({ name, tmux_target }) => {
   await ensureStore();
 
+  // tmux_target のバリデーション（指定時のみ）
+  let validatedTmuxTarget = tmux_target;
+  let tmuxWarning: string | null = null;
+
+  if (tmux_target) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        execFile("tmux", ["display-message", "-t", tmux_target, "-p", "#{pane_id}"], (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+    } catch {
+      tmuxWarning = `警告: tmux_target "${tmux_target}" のペインが見つかりません。通知機能は無効です。`;
+      validatedTmuxTarget = undefined;
+    }
+  }
+
   return await withFileLock(async () => {
     const sessions = cleanStaleSessions(await readSessions());
 
     const now = new Date().toISOString();
     sessions[name] = {
       name,
-      tmux_target,
+      tmux_target: validatedTmuxTarget,
       status: "idle",
       registered_at: sessions[name]?.registered_at ?? now,
       last_seen: now,
@@ -409,11 +437,17 @@ server.registerTool("wire_register", {
 
     currentSessionName = name;
 
+    await appendAuditLog({ action: "register", session: name, details: { tmux_target: validatedTmuxTarget ?? null } });
+
+    const message = tmuxWarning
+      ? `セッション "${name}" を登録しました。\n\n${tmuxWarning}\n\n現在の接続セッション数: ${Object.keys(sessions).length}`
+      : `セッション "${name}" を登録しました。\n\n現在の接続セッション数: ${Object.keys(sessions).length}`;
+
     return {
       content: [
         {
           type: "text" as const,
-          text: `セッション "${name}" を登録しました。\n\n現在の接続セッション数: ${Object.keys(sessions).length}`,
+          text: message,
         },
       ],
     };
@@ -428,7 +462,7 @@ server.registerTool("wire_send", {
   inputSchema: {
     to: z.string().describe("送信先セッション名"),
     content: z.string().describe("メッセージ内容"),
-    type: z.enum(["task_request", "response", "status_update"]).default("task_request").describe("メッセージタイプ"),
+    type: z.enum(["task_request", "response", "status_update", "question", "health_ping", "conflict_warning"]).default("task_request").describe("メッセージタイプ"),
     reply_to: z.string().nullable().default(null).describe("返信先メッセージID（返信の場合）"),
   },
 }, async ({ to, content, type, reply_to }) => {
@@ -480,6 +514,8 @@ server.registerTool("wire_send", {
       );
     }
 
+    await appendAuditLog({ action: "send", session: currentSessionName, details: { to, type, message_id: msg.id } });
+
     return {
       content: [{
         type: "text" as const,
@@ -521,6 +557,8 @@ server.registerTool("wire_receive", {
     for (const msg of messages) {
       await markMessageDelivered(msg, currentSessionName!);
     }
+
+    await appendAuditLog({ action: "receive", session: currentSessionName, details: { count: messages.length } });
 
     if (messages.length === 0) {
       return {
@@ -594,6 +632,8 @@ server.registerTool("wire_broadcast", {
     }
 
     const recipientCount = Object.keys(sessions).filter(n => n !== currentSessionName).length;
+
+    await appendAuditLog({ action: "broadcast", session: currentSessionName, details: { message_id: msg.id, recipient_count: recipientCount } });
 
     return {
       content: [{

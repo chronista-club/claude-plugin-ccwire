@@ -10,6 +10,15 @@ if [ ! -d "$CCWIRE_DIR" ]; then
   exit 0
 fi
 
+# Early return: check if any JSON files exist at all
+shopt -s nullglob
+all_json=("$CCWIRE_DIR"/*/*.json)
+shopt -u nullglob
+if [ ${#all_json[@]} -eq 0 ]; then
+  echo '{}'
+  exit 0
+fi
+
 messages=""
 count=0
 
@@ -17,17 +26,18 @@ for dir in "$CCWIRE_DIR"/*/; do
   [ -d "$dir" ] || continue
   for file in "$dir"*.json; do
     [ -f "$file" ] || continue
-    status=$(jq -r '.status // empty' "$file" 2>/dev/null)
-    from=$(jq -r '.from // "?"' "$file" 2>/dev/null)
-    to=$(jq -r '.to // "?"' "$file" 2>/dev/null)
+
+    # Single jq call to extract all needed fields at once
+    read -r status from to content < <(jq -r '[.status // "", .from // "?", .to // "?", (.content // "" | .[0:120])] | @tsv' "$file" 2>/dev/null)
 
     if [ "$to" = "*" ]; then
       # Broadcast: check per-session delivered_to array
       if [ -n "$SESSION_NAME" ]; then
-        # Skip if this session already received it, or if we sent it
+        # Skip if we sent it
         if [ "$from" = "$SESSION_NAME" ]; then
           continue
         fi
+        # Single jq call to check delivered_to for this session
         already_delivered=$(jq -r --arg s "$SESSION_NAME" '.delivered_to // [] | index($s) // empty' "$file" 2>/dev/null)
         if [ -n "$already_delivered" ]; then
           continue
@@ -38,13 +48,11 @@ for dir in "$CCWIRE_DIR"/*/; do
           continue
         fi
       fi
-      content=$(jq -r '.content // ""' "$file" 2>/dev/null | head -c 120)
       messages="${messages}- [${from} → broadcast]: ${content}\n"
       count=$((count + 1))
     else
       # Direct message: standard status check
       if [ "$status" = "pending" ]; then
-        content=$(jq -r '.content // ""' "$file" 2>/dev/null | head -c 120)
         messages="${messages}- [${from} → ${to}]: ${content}\n"
         count=$((count + 1))
       fi

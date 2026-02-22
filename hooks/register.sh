@@ -27,13 +27,22 @@ acquire_lock() {
     fi
     # stale lock check (10秒超)
     if [ -d "$LOCK_FILE" ]; then
-      local lock_age=$(( $(date +%s) - $(stat -f %m "$LOCK_FILE" 2>/dev/null || echo 0) ))
+      # Cross-platform: macOS uses stat -f %m, Linux uses stat -c %Y
+      local mtime
+      if stat -f %m "$LOCK_FILE" &>/dev/null; then
+        mtime=$(stat -f %m "$LOCK_FILE")
+      elif stat -c %Y "$LOCK_FILE" &>/dev/null; then
+        mtime=$(stat -c %Y "$LOCK_FILE")
+      else
+        mtime=0
+      fi
+      local lock_age=$(( $(date +%s) - mtime ))
       if [ "$lock_age" -gt 10 ]; then
         rmdir "$LOCK_FILE" 2>/dev/null
         continue
       fi
     fi
-    sleep 0.1
+    sleep 0.05
     i=$((i + 1))
   done
   return 1
