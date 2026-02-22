@@ -8,12 +8,17 @@ DB_PATH="$HOME/.cache/ccwire/ccwire.db"
 sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
-# 環境変数がなければ従来のガイドメッセージを表示
+# セッション名の決定: 環境変数 > tmux セッション名 > プロジェクトディレクトリ名
 if [ -z "$CCWIRE_SESSION_NAME" ]; then
-  cat <<'GUIDE'
-{"additionalContext": "## ccwire-protocol\n\nCC間通信プロトコルが利用可能です。\n\n他のCCセッションと通信するには、まず `wire_register` でセッションを登録してください。\n\n```\nwire_register(name=\"your-session-name\")\n```\n\n登録後は wire_send / wire_receive でメッセージの送受信、wire_sessions でセッション一覧確認ができます。"}
-GUIDE
-  exit 0
+  CCWIRE_SESSION_NAME=$(tmux display-message -p '#S' 2>/dev/null)
+fi
+if [ -z "$CCWIRE_SESSION_NAME" ]; then
+  CCWIRE_SESSION_NAME=$(basename "${CLAUDE_PROJECT_DIR:-$(pwd)}")
+fi
+
+# tmux_target の自動検出
+if [ -z "$CCWIRE_TMUX_TARGET" ]; then
+  CCWIRE_TMUX_TARGET=$(tmux display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)
 fi
 
 SAFE_NAME=$(sql_escape "$CCWIRE_SESSION_NAME")
@@ -29,7 +34,7 @@ fi
 
 NOW=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
 
-# tmux_target の組み立て
+# tmux_target の組み立て（上で自動検出済み）
 TMUX_TARGET="null"
 if [ -n "$CCWIRE_TMUX_TARGET" ]; then
   SAFE_TMUX=$(sql_escape "$CCWIRE_TMUX_TARGET")
