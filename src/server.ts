@@ -211,7 +211,7 @@ function execTmux(...args: string[]): Promise<{ ok: boolean; error?: string }> {
 }
 
 async function notifyViaTmux(tmuxTarget: string, message: string): Promise<void> {
-  await execTmux("send-keys", "-t", tmuxTarget, message);
+  await execTmux("send-keys", "-t", tmuxTarget, "-l", message);
   await Bun.sleep(500);
   await execTmux("send-keys", "-t", tmuxTarget, "Enter");
 }
@@ -731,7 +731,7 @@ server.registerTool("wire_thread", {
       JOIN thread t ON m.reply_to = t.id
       WHERE t.depth < ?
     )
-    SELECT msg.* FROM messages msg
+    SELECT DISTINCT msg.* FROM messages msg
     JOIN thread t ON msg.id = t.id
     ORDER BY msg.timestamp ASC
     LIMIT 500
@@ -771,6 +771,14 @@ server.registerTool("wire_control", {
     text: z.string().optional().describe("action='text' の場合に送信するテキスト"),
   },
 }, async ({ session, action, text }) => {
+  const self = resolveCurrentSession();
+  if (!self) {
+    return {
+      content: [{ type: "text" as const, text: "エラー: セッションが見つかりません。wire_register で登録してください。" }],
+      isError: true,
+    };
+  }
+
   cleanStaleSessions();
 
   const target = db.query<Session, [string]>(`SELECT * FROM sessions WHERE name = ?`).get(session);
@@ -825,7 +833,7 @@ server.registerTool("wire_control", {
       break;
   }
 
-  auditLog("control", resolveCurrentSession(), {
+  auditLog("control", self, {
     target_session: session,
     control_action: action,
     text: text ?? null,
