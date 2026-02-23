@@ -18,8 +18,8 @@ const STORE_DIR = join(
 );
 const DB_PATH = join(STORE_DIR, "ccwire.db");
 
-// Session TTL: 24 hours
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+// Session TTL: 2 hours (zombie session mitigation)
+const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
 
 // ─────────────────────────────────────────────
 // Types
@@ -112,9 +112,31 @@ function auditLog(action: string, session: string | null, details: Record<string
   );
 }
 
+function isTmuxPaneAlive(tmuxTarget: string): boolean {
+  try {
+    const result = Bun.spawnSync(["tmux", "display-message", "-t", tmuxTarget, "-p", "#{pane_id}"]);
+    return result.exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
 function cleanStaleSessions(): void {
+  // TTL-based cleanup
   const cutoff = new Date(Date.now() - SESSION_TTL_MS).toISOString();
   db.run(`DELETE FROM sessions WHERE last_seen < ?`, [cutoff]);
+
+  // tmux liveness check: tmux_target があるセッションはペイン生存を確認
+  const tmuxSessions = db.query<Session, []>(
+    `SELECT * FROM sessions WHERE tmux_target IS NOT NULL`
+  ).all();
+
+  for (const s of tmuxSessions) {
+    if (!isTmuxPaneAlive(s.tmux_target!)) {
+      db.run(`DELETE FROM sessions WHERE name = ?`, [s.name]);
+      auditLog("auto_cleanup", s.name, { reason: "tmux_pane_dead", tmux_target: s.tmux_target });
+    }
+  }
 }
 
 function cleanStaleMessages(): number {

@@ -1,10 +1,13 @@
 #!/bin/bash
 # ccwire: SessionEnd auto-unregistration
-# CCWIRE_SESSION_NAME 環境変数があれば SQLite DB から削除する
+# セッション名を自動解決し、SQLite DB から削除する
 
-DB_PATH="$HOME/.cache/ccwire/ccwire.db"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
 
-# 環境変数がなければ何もしない
+CCWIRE_SESSION_NAME=$(resolve_session_name)
+
+# セッション名が解決できなければ何もしない
 if [ -z "$CCWIRE_SESSION_NAME" ]; then
   exit 0
 fi
@@ -14,5 +17,5 @@ if [ ! -f "$DB_PATH" ]; then
   exit 0
 fi
 
-SAFE_NAME=$(printf '%s' "$CCWIRE_SESSION_NAME" | sed "s/'/''/g")
+SAFE_NAME=$(sql_escape "$CCWIRE_SESSION_NAME")
 sqlite3 "$DB_PATH" "DELETE FROM sessions WHERE name = '$SAFE_NAME';" 2>/dev/null

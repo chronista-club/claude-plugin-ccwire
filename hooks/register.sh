@@ -1,20 +1,11 @@
 #!/bin/bash
 # ccwire: SessionStart auto-registration
-# CCWIRE_SESSION_NAME 環境変数があれば SQLite DB に直接登録する
+# セッション名を自動解決し、SQLite DB に直接登録する
 
-DB_PATH="$HOME/.cache/ccwire/ccwire.db"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
 
-# SQL/JSON安全なエスケープ
-sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
-json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-
-# セッション名の決定: 環境変数 > tmux セッション名 > プロジェクトディレクトリ名
-if [ -z "$CCWIRE_SESSION_NAME" ]; then
-  CCWIRE_SESSION_NAME=$(tmux display-message -p '#S' 2>/dev/null)
-fi
-if [ -z "$CCWIRE_SESSION_NAME" ]; then
-  CCWIRE_SESSION_NAME=$(basename "${CLAUDE_PROJECT_DIR:-$(pwd)}")
-fi
+CCWIRE_SESSION_NAME=$(resolve_session_name)
 
 # tmux_target の自動検出
 if [ -z "$CCWIRE_TMUX_TARGET" ]; then
