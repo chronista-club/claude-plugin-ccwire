@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { Database } from "bun:sqlite";
+import pkg from "../package.json";
 
 // ─────────────────────────────────────────────
 // Constants
@@ -105,6 +106,8 @@ function initDb(): void {
 // DB helpers
 // ─────────────────────────────────────────────
 
+const AUDIT_LOG_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 function auditLog(action: string, session: string | null, details: Record<string, unknown>): void {
   db.run(
     `INSERT INTO audit_log (action, session, details, timestamp) VALUES (?, ?, ?, ?)`,
@@ -112,16 +115,38 @@ function auditLog(action: string, session: string | null, details: Record<string
   );
 }
 
-function isTmuxPaneAlive(tmuxTarget: string): boolean {
-  try {
-    const result = Bun.spawnSync(["tmux", "display-message", "-t", tmuxTarget, "-p", "#{pane_id}"]);
-    return result.exitCode === 0;
-  } catch {
-    return false;
-  }
+function cleanStaleAuditLogs(): void {
+  const cutoff = new Date(Date.now() - AUDIT_LOG_TTL_MS).toISOString();
+  db.run(`DELETE FROM audit_log WHERE timestamp < ?`, [cutoff]);
 }
 
-function cleanStaleSessions(): void {
+// tmux ライブネスチェック キャッシュ (Issue #8)
+const TMUX_CACHE_TTL_MS = 30_000;
+const tmuxLivenessCache = new Map<string, { alive: boolean; checkedAt: number }>();
+
+function isTmuxPaneAlive(tmuxTarget: string, useCache = true): boolean {
+  if (useCache) {
+    const cached = tmuxLivenessCache.get(tmuxTarget);
+    if (cached && Date.now() - cached.checkedAt < TMUX_CACHE_TTL_MS) {
+      return cached.alive;
+    }
+  }
+
+  let alive = false;
+  try {
+    const result = Bun.spawnSync(["tmux", "display-message", "-t", tmuxTarget, "-p", "#{pane_id}"]);
+    alive = result.exitCode === 0;
+  } catch { /* tmux not available */ }
+
+  tmuxLivenessCache.set(tmuxTarget, { alive, checkedAt: Date.now() });
+  return alive;
+}
+
+/**
+ * cleanStaleSessions: ゾンビセッションの削除
+ * @param fullCheck true: キャッシュ無視でフルチェック (wire_sessions, wire_register 用)
+ */
+function cleanStaleSessions(fullCheck = false): void {
   // TTL-based cleanup
   const cutoff = new Date(Date.now() - SESSION_TTL_MS).toISOString();
   db.run(`DELETE FROM sessions WHERE last_seen < ?`, [cutoff]);
@@ -132,8 +157,9 @@ function cleanStaleSessions(): void {
   ).all();
 
   for (const s of tmuxSessions) {
-    if (!isTmuxPaneAlive(s.tmux_target!)) {
+    if (!isTmuxPaneAlive(s.tmux_target!, !fullCheck)) {
       db.run(`DELETE FROM sessions WHERE name = ?`, [s.name]);
+      tmuxLivenessCache.delete(s.tmux_target!);
       auditLog("auto_cleanup", s.name, { reason: "tmux_pane_dead", tmux_target: s.tmux_target });
     }
   }
@@ -141,11 +167,24 @@ function cleanStaleSessions(): void {
 
 function cleanStaleMessages(): number {
   const cutoff = new Date(Date.now() - SESSION_TTL_MS).toISOString();
+
   // Delete non-pending messages older than TTL
   const result = db.run(
     `DELETE FROM messages WHERE timestamp < ? AND status != 'pending'`,
     [cutoff]
   );
+
+  // Zombie メッセージ: 宛先セッションが消失した pending メッセージを削除 (Issue #5)
+  db.run(
+    `DELETE FROM messages WHERE status = 'pending' AND "to" != '*'
+     AND "to" NOT IN (SELECT name FROM sessions)`
+  );
+
+  // broadcast_deliveries の TTL クリーンアップ: 対応メッセージが存在しないレコードを削除 (Issue #5)
+  db.run(
+    `DELETE FROM broadcast_deliveries WHERE message_id NOT IN (SELECT id FROM messages)`
+  );
+
   return result.changes;
 }
 
@@ -157,9 +196,17 @@ function touchSession(name: string): void {
 // tmux notification helper
 // ─────────────────────────────────────────────
 
-function execTmux(...args: string[]): Promise<void> {
-  return new Promise<void>((resolve) => {
-    execFile("tmux", args, (err) => resolve());
+const TMUX_TIMEOUT_MS = 5_000;
+
+function execTmux(...args: string[]): Promise<{ ok: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    const child = execFile("tmux", args, { timeout: TMUX_TIMEOUT_MS }, (err) => {
+      if (err) {
+        resolve({ ok: false, error: err.message });
+      } else {
+        resolve({ ok: true });
+      }
+    });
   });
 }
 
@@ -175,13 +222,64 @@ async function notifyViaTmux(tmuxTarget: string, message: string): Promise<void>
 
 let currentSessionName: string | null = null;
 
+/**
+ * currentSessionName を自動復元する。
+ * フォールバック: 環境変数 CCWIRE_SESSION_NAME → tmux セッション名 → cwd basename
+ * DB に該当セッションが存在すればそれを使う。
+ */
+function resolveCurrentSession(): string | null {
+  if (currentSessionName) {
+    // DB に存在するか確認（セッションが消えていたらリセット）
+    const exists = db.query<{ name: string }, [string]>(
+      `SELECT name FROM sessions WHERE name = ?`
+    ).get(currentSessionName);
+    if (exists) return currentSessionName;
+    currentSessionName = null;
+  }
+
+  // フォールバックチェーン
+  const candidates: string[] = [];
+
+  // 1. 環境変数
+  const envName = process.env.CCWIRE_SESSION_NAME;
+  if (envName) candidates.push(envName);
+
+  // 2. tmux セッション名
+  try {
+    const result = Bun.spawnSync(["tmux", "display-message", "-p", "#S"]);
+    if (result.exitCode === 0) {
+      const tmuxName = result.stdout.toString().trim();
+      if (tmuxName) candidates.push(tmuxName);
+    }
+  } catch { /* tmux not available */ }
+
+  // 3. cwd ベースネーム
+  const cwdName = process.env.CLAUDE_PROJECT_DIR
+    ? process.env.CLAUDE_PROJECT_DIR.split("/").pop()!
+    : process.cwd().split("/").pop()!;
+  if (cwdName) candidates.push(cwdName);
+
+  // DB で最初にマッチするものを採用
+  for (const name of candidates) {
+    const session = db.query<{ name: string }, [string]>(
+      `SELECT name FROM sessions WHERE name = ?`
+    ).get(name);
+    if (session) {
+      currentSessionName = session.name;
+      return currentSessionName;
+    }
+  }
+
+  return null;
+}
+
 // ─────────────────────────────────────────────
 // MCP Server
 // ─────────────────────────────────────────────
 
 const server = new McpServer({
   name: "ccwire",
-  version: "0.1.0",
+  version: pkg.version,
 });
 
 // ── wire_register ───────────────────────────
@@ -212,7 +310,7 @@ server.registerTool("wire_register", {
     }
   }
 
-  cleanStaleSessions();
+  cleanStaleSessions(true); // フルチェック
 
   const now = new Date().toISOString();
   const existing = db.query<{ registered_at: string }, [string]>(
@@ -252,9 +350,10 @@ server.registerTool("wire_send", {
     reply_to: z.string().nullable().default(null).describe("返信先メッセージID（返信の場合）"),
   },
 }, async ({ to, content, type, reply_to }) => {
-  if (!currentSessionName) {
+  const sender = resolveCurrentSession();
+  if (!sender) {
     return {
-      content: [{ type: "text" as const, text: "エラー: まず wire_register でセッションを登録してください。" }],
+      content: [{ type: "text" as const, text: "エラー: セッションが見つかりません。wire_register で登録してください。" }],
       isError: true,
     };
   }
@@ -271,7 +370,7 @@ server.registerTool("wire_send", {
     };
   }
 
-  touchSession(currentSessionName);
+  touchSession(sender);
 
   const msgId = `msg-${randomUUID()}`;
   const now = new Date().toISOString();
@@ -279,7 +378,7 @@ server.registerTool("wire_send", {
   db.run(
     `INSERT INTO messages (id, "from", "to", type, content, timestamp, reply_to, status)
      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
-    [msgId, currentSessionName, to, type, content, now, reply_to ?? null]
+    [msgId, sender, to, type, content, now, reply_to ?? null]
   );
 
   // Auto-notify via tmux
@@ -287,7 +386,7 @@ server.registerTool("wire_send", {
     await notifyViaTmux(target.tmux_target, `wire_receiveで未読メッセージを確認して`);
   }
 
-  auditLog("send", currentSessionName, { to, type, message_id: msgId });
+  auditLog("send", sender, { to, type, message_id: msgId });
 
   return {
     content: [{
@@ -306,40 +405,42 @@ server.registerTool("wire_receive", {
     limit: z.number().default(10).describe("取得するメッセージの最大数"),
   },
 }, async ({ limit }) => {
-  if (!currentSessionName) {
+  const receiver = resolveCurrentSession();
+  if (!receiver) {
     return {
-      content: [{ type: "text" as const, text: "エラー: まず wire_register でセッションを登録してください。" }],
+      content: [{ type: "text" as const, text: "エラー: セッションが見つかりません。wire_register で登録してください。" }],
       isError: true,
     };
   }
 
-  touchSession(currentSessionName);
+  touchSession(receiver);
 
-  // Direct + broadcast を統合クエリで取得（timestamp順、limit適用）
-  const allMessages = db.query<MessageRow, [string, string, string, number]>(
-    `SELECT * FROM messages
-     WHERE ("to" = ? AND status = 'pending')
-        OR ("to" = '*' AND "from" != ?
-            AND id NOT IN (SELECT message_id FROM broadcast_deliveries WHERE session_name = ?))
-     ORDER BY timestamp ASC
-     LIMIT ?`
-  ).all(currentSessionName, currentSessionName, currentSessionName, limit);
+  // トランザクションで SELECT → UPDATE をアトミックに実行 (Issue #5)
+  const allMessages = db.transaction(() => {
+    const messages = db.query<MessageRow, [string, string, string, number]>(
+      `SELECT * FROM messages
+       WHERE ("to" = ? AND status = 'pending')
+          OR ("to" = '*' AND "from" != ?
+              AND id NOT IN (SELECT message_id FROM broadcast_deliveries WHERE session_name = ?))
+       ORDER BY timestamp ASC
+       LIMIT ?`
+    ).all(receiver, receiver, receiver, limit);
 
-  // Mark direct messages as delivered
-  for (const msg of allMessages) {
-    if (msg.to === "*") {
-      // Broadcast: record per-session delivery
-      db.run(
-        `INSERT OR IGNORE INTO broadcast_deliveries (message_id, session_name) VALUES (?, ?)`,
-        [msg.id, currentSessionName]
-      );
-    } else {
-      // Direct: mark as delivered
-      db.run(`UPDATE messages SET status = 'delivered' WHERE id = ?`, [msg.id]);
+    for (const msg of messages) {
+      if (msg.to === "*") {
+        db.run(
+          `INSERT OR IGNORE INTO broadcast_deliveries (message_id, session_name) VALUES (?, ?)`,
+          [msg.id, receiver]
+        );
+      } else {
+        db.run(`UPDATE messages SET status = 'delivered' WHERE id = ?`, [msg.id]);
+      }
     }
-  }
 
-  auditLog("receive", currentSessionName, { count: allMessages.length });
+    return messages;
+  })();
+
+  auditLog("receive", receiver, { count: allMessages.length });
 
   if (allMessages.length === 0) {
     return {
@@ -369,15 +470,16 @@ server.registerTool("wire_broadcast", {
     content: z.string().describe("ブロードキャストメッセージ内容"),
   },
 }, async ({ content }) => {
-  if (!currentSessionName) {
+  const sender = resolveCurrentSession();
+  if (!sender) {
     return {
-      content: [{ type: "text" as const, text: "エラー: まず wire_register でセッションを登録してください。" }],
+      content: [{ type: "text" as const, text: "エラー: セッションが見つかりません。wire_register で登録してください。" }],
       isError: true,
     };
   }
 
   cleanStaleSessions();
-  touchSession(currentSessionName);
+  touchSession(sender);
 
   const msgId = `msg-${randomUUID()}`;
   const now = new Date().toISOString();
@@ -385,13 +487,13 @@ server.registerTool("wire_broadcast", {
   db.run(
     `INSERT INTO messages (id, "from", "to", type, content, timestamp, reply_to, status)
      VALUES (?, ?, '*', 'broadcast', ?, ?, NULL, 'pending')`,
-    [msgId, currentSessionName, content, now]
+    [msgId, sender, content, now]
   );
 
   // Auto-notify all sessions with tmux_target
   const recipients = db.query<Session, [string]>(
     `SELECT * FROM sessions WHERE name != ? AND tmux_target IS NOT NULL`
-  ).all(currentSessionName);
+  ).all(sender);
 
   for (const s of recipients) {
     await notifyViaTmux(s.tmux_target!, `wire_receiveで未読メッセージを確認して`);
@@ -399,9 +501,9 @@ server.registerTool("wire_broadcast", {
 
   const recipientCount = db.query<{ cnt: number }, [string]>(
     `SELECT COUNT(*) as cnt FROM sessions WHERE name != ?`
-  ).get(currentSessionName)!.cnt;
+  ).get(sender)!.cnt;
 
-  auditLog("broadcast", currentSessionName, { message_id: msgId, recipient_count: recipientCount });
+  auditLog("broadcast", sender, { message_id: msgId, recipient_count: recipientCount });
 
   return {
     content: [{
@@ -418,9 +520,11 @@ server.registerTool("wire_sessions", {
   description: "接続中のセッション一覧を取得する。",
   inputSchema: {},
 }, async () => {
-  cleanStaleSessions();
+  cleanStaleSessions(true); // フルチェック
   const cleanedMsgs = cleanStaleMessages();
+  cleanStaleAuditLogs();
 
+  const self = resolveCurrentSession();
   const sessions = db.query<Session, []>(`SELECT * FROM sessions`).all();
 
   if (sessions.length === 0) {
@@ -430,7 +534,7 @@ server.registerTool("wire_sessions", {
   }
 
   const lines = sessions.map((s) => {
-    const isSelf = s.name === currentSessionName ? " (自分)" : "";
+    const isSelf = s.name === self ? " (自分)" : "";
     const tmux = s.tmux_target ? ` [tmux: ${s.tmux_target}]` : "";
     return `  ${s.name}${isSelf} - ${s.status}${tmux} (last: ${s.last_seen})`;
   });
@@ -457,24 +561,17 @@ server.registerTool("wire_status", {
   cleanStaleSessions();
 
   if (status) {
-    if (!currentSessionName) {
+    const self = resolveCurrentSession();
+    if (!self) {
       return {
-        content: [{ type: "text" as const, text: "エラー: まず wire_register でセッションを登録してください。" }],
-        isError: true,
-      };
-    }
-
-    const existing = db.query<Session, [string]>(`SELECT * FROM sessions WHERE name = ?`).get(currentSessionName);
-    if (!existing) {
-      return {
-        content: [{ type: "text" as const, text: "エラー: まず wire_register でセッションを登録してください。" }],
+        content: [{ type: "text" as const, text: "エラー: セッションが見つかりません。wire_register で登録してください。" }],
         isError: true,
       };
     }
 
     db.run(
       `UPDATE sessions SET status = ?, last_seen = ? WHERE name = ?`,
-      [status, new Date().toISOString(), currentSessionName]
+      [status, new Date().toISOString(), self]
     );
 
     return {
@@ -486,9 +583,10 @@ server.registerTool("wire_status", {
   }
 
   // Return all statuses
+  const self = resolveCurrentSession();
   const sessions = db.query<Session, []>(`SELECT * FROM sessions`).all();
   const lines = sessions.map((s) => {
-    const isSelf = s.name === currentSessionName ? " ★" : "";
+    const isSelf = s.name === self ? " ★" : "";
     return `  ${s.name}: ${s.status}${isSelf}`;
   });
 
@@ -509,11 +607,20 @@ server.registerTool("wire_unregister", {
     name: z.string().optional().describe("解除するセッション名。省略時は自分自身。"),
   },
 }, async ({ name }) => {
-  const targetName = name ?? currentSessionName;
+  const self = resolveCurrentSession();
+  const targetName = name ?? self;
 
   if (!targetName) {
     return {
       content: [{ type: "text" as const, text: "エラー: セッション名を指定するか、先に wire_register で登録してください。" }],
+      isError: true,
+    };
+  }
+
+  // 認可チェック: 他セッションの削除は拒否 (Issue #3)
+  if (self && targetName !== self) {
+    return {
+      content: [{ type: "text" as const, text: `エラー: 他セッション "${targetName}" の登録解除はできません。自分自身のセッションのみ解除可能です。` }],
       isError: true,
     };
   }
@@ -551,9 +658,10 @@ server.registerTool("wire_ack", {
     message_id: z.string().describe("確認するメッセージID"),
   },
 }, async ({ message_id }) => {
-  if (!currentSessionName) {
+  const self = resolveCurrentSession();
+  if (!self) {
     return {
-      content: [{ type: "text" as const, text: "エラー: まず wire_register でセッションを登録してください。" }],
+      content: [{ type: "text" as const, text: "エラー: セッションが見つかりません。wire_register で登録してください。" }],
       isError: true,
     };
   }
@@ -562,6 +670,14 @@ server.registerTool("wire_ack", {
   if (!msg) {
     return {
       content: [{ type: "text" as const, text: `エラー: メッセージ "${message_id}" が見つかりません。` }],
+      isError: true,
+    };
+  }
+
+  // 認可チェック: 自分宛 or 自分発のメッセージのみ ack 可能 (Issue #3)
+  if (msg.to !== self && msg.to !== "*" && msg.from !== self) {
+    return {
+      content: [{ type: "text" as const, text: `エラー: メッセージ "${message_id}" は自分宛でも自分発でもないため、確認できません。` }],
       isError: true,
     };
   }
@@ -585,16 +701,19 @@ server.registerTool("wire_thread", {
     message_id: z.string().describe("スレッド内の任意のメッセージID"),
   },
 }, async ({ message_id }) => {
-  // Find the root of the thread by tracing reply_to chain upward
-  const rootRow = db.query<{ id: string }, [string]>(`
-    WITH RECURSIVE ancestors(id, reply_to) AS (
-      SELECT id, reply_to FROM messages WHERE id = ?
-      UNION ALL
-      SELECT m.id, m.reply_to FROM messages m
+  const THREAD_DEPTH_LIMIT = 100;
+
+  // Find the root of the thread by tracing reply_to chain upward (Issue #7: UNION + depth limit)
+  const rootRow = db.query<{ id: string }, [string, number]>(`
+    WITH RECURSIVE ancestors(id, reply_to, depth) AS (
+      SELECT id, reply_to, 0 FROM messages WHERE id = ?
+      UNION
+      SELECT m.id, m.reply_to, a.depth + 1 FROM messages m
       JOIN ancestors a ON m.id = a.reply_to
+      WHERE a.depth < ?
     )
-    SELECT id FROM ancestors WHERE reply_to IS NULL
-  `).get(message_id);
+    SELECT id FROM ancestors WHERE reply_to IS NULL LIMIT 1
+  `).get(message_id, THREAD_DEPTH_LIMIT);
 
   if (!rootRow) {
     return {
@@ -603,18 +722,20 @@ server.registerTool("wire_thread", {
     };
   }
 
-  // Collect all descendants from the root
-  const thread = db.query<MessageRow, [string]>(`
-    WITH RECURSIVE thread(id) AS (
-      SELECT id FROM messages WHERE id = ?
-      UNION ALL
-      SELECT m.id FROM messages m
+  // Collect all descendants from the root (Issue #7: UNION + depth limit + LIMIT)
+  const thread = db.query<MessageRow, [string, number]>(`
+    WITH RECURSIVE thread(id, depth) AS (
+      SELECT id, 0 FROM messages WHERE id = ?
+      UNION
+      SELECT m.id, t.depth + 1 FROM messages m
       JOIN thread t ON m.reply_to = t.id
+      WHERE t.depth < ?
     )
     SELECT msg.* FROM messages msg
     JOIN thread t ON msg.id = t.id
     ORDER BY msg.timestamp ASC
-  `).all(rootRow.id);
+    LIMIT 500
+  `).all(rootRow.id, THREAD_DEPTH_LIMIT);
 
   if (thread.length === 0) {
     return {
@@ -670,9 +791,9 @@ server.registerTool("wire_control", {
     };
   }
 
-  if (action === "text" && !text) {
+  if (action === "text" && (!text || text.length === 0)) {
     return {
-      content: [{ type: "text" as const, text: `エラー: action="text" の場合は text パラメータが必須です。` }],
+      content: [{ type: "text" as const, text: `エラー: action="text" の場合は空でない text パラメータが必須です。` }],
       isError: true,
     };
   }
@@ -697,13 +818,14 @@ server.registerTool("wire_control", {
       await execTmux("send-keys", "-t", tmux, "C-c");
       break;
     case "text":
-      await execTmux("send-keys", "-t", tmux, text!);
+      // -l: リテラルモードで送信（特殊キー解釈を防止）(Issue #4)
+      await execTmux("send-keys", "-t", tmux, "-l", text!);
       await Bun.sleep(100);
       await execTmux("send-keys", "-t", tmux, "Enter");
       break;
   }
 
-  auditLog("control", currentSessionName, {
+  auditLog("control", resolveCurrentSession(), {
     target_session: session,
     control_action: action,
     text: text ?? null,

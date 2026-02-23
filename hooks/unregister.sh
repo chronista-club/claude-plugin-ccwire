@@ -18,4 +18,4 @@ if [ ! -f "$DB_PATH" ]; then
 fi
 
 SAFE_NAME=$(sql_escape "$CCWIRE_SESSION_NAME")
-sqlite3 "$DB_PATH" "DELETE FROM sessions WHERE name = '$SAFE_NAME';" 2>/dev/null
+run_sql "DELETE FROM sessions WHERE name = '${SAFE_NAME}';"
