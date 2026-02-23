@@ -5,7 +5,7 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
-SESSION_NAME="${CCWIRE_SESSION_NAME:-}"
+SESSION_NAME=$(resolve_session_name)
 
 if [ ! -f "$DB_PATH" ]; then
   echo '{}'

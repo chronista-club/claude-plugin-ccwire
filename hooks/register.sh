@@ -35,7 +35,7 @@ fi
 # 既存の registered_at を保持、なければ現在時刻
 EXISTING_REGISTERED=$(run_sql "SELECT registered_at FROM sessions WHERE name = '${SAFE_NAME}';")
 if [ -n "$EXISTING_REGISTERED" ]; then
-  REGISTERED_AT="$EXISTING_REGISTERED"
+  REGISTERED_AT=$(sql_escape "$EXISTING_REGISTERED")
 else
   REGISTERED_AT="$NOW"
 fi
