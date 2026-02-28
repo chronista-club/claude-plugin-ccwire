@@ -18,7 +18,7 @@ const DB_PATH = join(STORE_DIR, "ccwire.db");
 // Session TTL: 10 minutes (heartbeat-based zombie mitigation, #15)
 const SESSION_TTL_MS = 10 * 60 * 1000;
 
-const AUDIT_LOG_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const AUDIT_LOG_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 // ─────────────────────────────────────────────
 // Shared state (module-private)

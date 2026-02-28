@@ -69,6 +69,25 @@ describe("wire_register", () => {
     // Assert
     expect(getCurrentSessionName()).toBe("my-name");
   });
+
+  test("登録時に broadcast_cursor が現在時刻で設定される", async () => {
+    // Arrange
+    const before = new Date().toISOString();
+
+    // Act
+    await client.callTool({ name: "wire_register", arguments: { name: "cursor-test" } });
+
+    // Assert
+    const after = new Date().toISOString();
+    const db = getDb();
+    const session = db.query<{ broadcast_cursor: string | null }, [string]>(
+      `SELECT broadcast_cursor FROM sessions WHERE name = ?`
+    ).get("cursor-test");
+    expect(session).toBeDefined();
+    expect(session!.broadcast_cursor).not.toBeNull();
+    expect(session!.broadcast_cursor! >= before).toBe(true);
+    expect(session!.broadcast_cursor! <= after).toBe(true);
+  });
 });
 
 // ─────────────────────────────────────────────
