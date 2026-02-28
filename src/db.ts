@@ -31,10 +31,12 @@ let currentSessionName: string | null = null;
 // Initialization
 // ─────────────────────────────────────────────
 
-export async function initDb(): Promise<void> {
-  await mkdir(STORE_DIR, { recursive: true });
+export async function initDb(dbPath?: string): Promise<void> {
+  if (!dbPath) {
+    await mkdir(STORE_DIR, { recursive: true });
+  }
 
-  db = new Database(DB_PATH);
+  db = new Database(dbPath ?? DB_PATH);
   db.run("PRAGMA journal_mode = WAL");
 
   db.run(`
