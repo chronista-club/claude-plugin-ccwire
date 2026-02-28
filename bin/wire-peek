@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# wire-peek: ccwire 未読メッセージを read-only で高速取得
+# Usage: wire-peek [session_name] [--from NAME] [--type TYPE] [--limit N] [--json]
+set -euo pipefail
+
+DB="${CCWIRE_DB:-$HOME/.cache/ccwire/ccwire.db}"
+
+if [[ ! -f "$DB" ]]; then
+  echo "エラー: DB が見つかりません: $DB" >&2
+  exit 1
+fi
+
+# デフォルト値
+SESSION=""
+FROM_FILTER=""
+TYPE_FILTER=""
+LIMIT=10
+JSON_MODE=false
+
+# 引数パース
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from)  FROM_FILTER="$2"; shift 2 ;;
+    --type)  TYPE_FILTER="$2"; shift 2 ;;
+    --limit) LIMIT="$2"; shift 2 ;;
+    --json)  JSON_MODE=true; shift ;;
+    --help|-h)
+      echo "Usage: wire-peek [session] [--from NAME] [--type TYPE] [--limit N] [--json]"
+      echo ""
+      echo "  session   セッション名（省略時: \$CCWIRE_SESSION_NAME or tmux session name）"
+      echo "  --from    送信元でフィルタ"
+      echo "  --type    メッセージタイプでフィルタ"
+      echo "  --limit   最大取得数 (default: 10)"
+      echo "  --json    JSON 出力"
+      exit 0
+      ;;
+    -*) echo "不明なオプション: $1" >&2; exit 1 ;;
+    *)  SESSION="$1"; shift ;;
+  esac
+done
+
+# セッション名の自動解決
+if [[ -z "$SESSION" ]]; then
+  if [[ -n "${CCWIRE_SESSION_NAME:-}" ]]; then
+    SESSION="$CCWIRE_SESSION_NAME"
+  elif command -v tmux &>/dev/null && tmux display-message -p '#S' 2>/dev/null; then
+    SESSION=$(tmux display-message -p '#S' 2>/dev/null) || true
+  fi
+fi
+
+if [[ -z "$SESSION" ]]; then
+  echo "エラー: セッション名を指定するか CCWIRE_SESSION_NAME を設定してください" >&2
+  exit 1
+fi
+
+# broadcast_cursor を取得
+CURSOR=$(sqlite3 "$DB" "SELECT COALESCE(broadcast_cursor, '0') FROM sessions WHERE name = '$SESSION';" 2>/dev/null || echo "0")
+
+# WHERE 条件を動的構築
+PERSONAL_WHERE="(\"to\" = '$SESSION' AND status = 'pending')"
+BROADCAST_WHERE="(\"to\" = '*' AND \"from\" != '$SESSION' AND timestamp > '$CURSOR')"
+
+if [[ -n "$FROM_FILTER" ]]; then
+  PERSONAL_WHERE="(\"to\" = '$SESSION' AND status = 'pending' AND \"from\" = '$FROM_FILTER')"
+  BROADCAST_WHERE="(\"to\" = '*' AND \"from\" != '$SESSION' AND timestamp > '$CURSOR' AND \"from\" = '$FROM_FILTER')"
+fi
+
+if [[ -n "$TYPE_FILTER" ]]; then
+  PERSONAL_WHERE="${PERSONAL_WHERE/)/AND type = '$TYPE_FILTER')}"
+  BROADCAST_WHERE="${BROADCAST_WHERE/)/AND type = '$TYPE_FILTER')}"
+fi
+
+QUERY="SELECT id, \"from\", \"to\", type, content, timestamp, reply_to, status
+       FROM messages
+       WHERE $PERSONAL_WHERE OR $BROADCAST_WHERE
+       ORDER BY timestamp ASC
+       LIMIT $LIMIT;"
+
+if $JSON_MODE; then
+  sqlite3 -json "$DB" "$QUERY" 2>/dev/null
+  exit $?
+fi
+
+# テーブル表示
+COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM messages WHERE $PERSONAL_WHERE OR $BROADCAST_WHERE;" 2>/dev/null || echo "0")
+
+if [[ "$COUNT" -eq 0 ]]; then
+  echo "未読メッセージはありません ($SESSION)"
+  exit 0
+fi
+
+echo "未読メッセージ ${COUNT}件 ($SESSION):"
+echo ""
+sqlite3 -separator '|' "$DB" "$QUERY" 2>/dev/null | while IFS='|' read -r id from to type content timestamp reply_to status; do
+  echo "[$from] ($type) $timestamp"
+  if [[ -n "$reply_to" && "$reply_to" != "" ]]; then
+    echo "  Reply-To: $reply_to"
+  fi
+  echo "  $content"
+  echo "  ID: $id"
+  echo ""
+done
