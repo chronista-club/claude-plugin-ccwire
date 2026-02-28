@@ -84,6 +84,49 @@ describe("wire_send", () => {
     expect(result.isError).toBe(true);
     expect(getText(result)).toContain("wire_register");
   });
+
+  test("10,001文字以上のcontentはエラーになる", async () => {
+    // Arrange
+    await client.callTool({ name: "wire_register", arguments: { name: "sender" } });
+    const db = getDb();
+    db.run(
+      `INSERT INTO sessions (name, tmux_target, status, registered_at, last_seen)
+       VALUES ('receiver', NULL, 'idle', ?, ?)`,
+      [new Date().toISOString(), new Date().toISOString()]
+    );
+    const longContent = "x".repeat(10001);
+
+    // Act
+    const result = await client.callTool({
+      name: "wire_send",
+      arguments: { to: "receiver", content: longContent },
+    });
+
+    // Assert
+    expect(result.isError).toBe(true);
+  });
+
+  test("10,000文字のcontentは送信できる", async () => {
+    // Arrange
+    await client.callTool({ name: "wire_register", arguments: { name: "sender" } });
+    const db = getDb();
+    db.run(
+      `INSERT INTO sessions (name, tmux_target, status, registered_at, last_seen)
+       VALUES ('receiver', NULL, 'idle', ?, ?)`,
+      [new Date().toISOString(), new Date().toISOString()]
+    );
+    const maxContent = "x".repeat(10000);
+
+    // Act
+    const result = await client.callTool({
+      name: "wire_send",
+      arguments: { to: "receiver", content: maxContent },
+    });
+
+    // Assert
+    expect(result.isError).toBeUndefined();
+    expect(getText(result)).toContain("メッセージ送信完了");
+  });
 });
 
 // ─────────────────────────────────────────────

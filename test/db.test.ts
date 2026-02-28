@@ -336,10 +336,10 @@ describe("auditLog / cleanStaleAuditLogs", () => {
     expect(JSON.parse(logs[0].details)).toEqual({ key: "value" });
   });
 
-  test("7日超過ログを削除する", () => {
-    // Arrange: 8日前のログを直接挿入
+  test("24時間超過ログを削除する", () => {
+    // Arrange: 25時間前のログを直接挿入
     const db = getDb();
-    const oldTime = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+    const oldTime = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
     db.run(
       `INSERT INTO audit_log (action, session, details, timestamp) VALUES ('old', 'old-session', '{}', ?)`,
       [oldTime]
@@ -355,6 +355,26 @@ describe("auditLog / cleanStaleAuditLogs", () => {
       .all();
     expect(logs).toHaveLength(1);
     expect(logs[0].action).toBe("recent");
+  });
+
+  test("24時間以内のログは削除しない", () => {
+    // Arrange: 23時間前のログ
+    const db = getDb();
+    const recentTime = new Date(Date.now() - 23 * 60 * 60 * 1000).toISOString();
+    db.run(
+      `INSERT INTO audit_log (action, session, details, timestamp) VALUES ('within-ttl', 'session', '{}', ?)`,
+      [recentTime]
+    );
+
+    // Act
+    cleanStaleAuditLogs();
+
+    // Assert
+    const logs = db
+      .query<{ action: string }, []>(`SELECT action FROM audit_log`)
+      .all();
+    expect(logs).toHaveLength(1);
+    expect(logs[0].action).toBe("within-ttl");
   });
 });
 

@@ -19,7 +19,7 @@ export function registerMessagingTools(server: McpServer): void {
     description: "特定のセッションにメッセージを送信する。",
     inputSchema: {
       to: z.string().describe("送信先セッション名"),
-      content: z.string().describe("メッセージ内容"),
+      content: z.string().max(10000).describe("メッセージ内容"),
       type: z.enum(["task_request", "response", "status_update", "question", "health_ping", "conflict_warning"]).default("task_request").describe("メッセージタイプ"),
       reply_to: z.string().nullable().default(null).describe("返信先メッセージID（返信の場合）"),
     },
@@ -151,7 +151,7 @@ export function registerMessagingTools(server: McpServer): void {
     title: "Wire Broadcast",
     description: "全セッションに一斉メッセージを送信する。",
     inputSchema: {
-      content: z.string().describe("ブロードキャストメッセージ内容"),
+      content: z.string().max(10000).describe("ブロードキャストメッセージ内容"),
     },
   }, async ({ content }) => {
     const db = getDb();
