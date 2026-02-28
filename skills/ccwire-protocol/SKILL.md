@@ -57,7 +57,8 @@ wire_receive(limit=10)
 ```
 
 - 自分宛の未読メッセージ + ブロードキャストを取得
-- 取得したメッセージは「delivered」に変わる
+- direct メッセージは「delivered」に変わる
+- broadcast は `broadcast_cursor`（タイムスタンプ）で既読管理
 
 ### 4. 受信確認
 
