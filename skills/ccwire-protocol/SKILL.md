@@ -230,6 +230,7 @@ tmux send-keys -t cw:0.0 Enter
 
 ## 注意事項
 
-- セッションは2時間で自動的に期限切れになる（SESSION_TTL: 2h）
+- セッション TTL は 10 分。Heartbeat（3分間隔）で `last_seen` を自動更新し、heartbeat が途切れたセッションは自動削除
+- `wire_register` 時に `process.pid` を記録。クリーンアップ時に PID 生存を確認し、プロセスが死んだセッションを即座に削除（tmux 非依存）
 - SQLite WAL モードで同時アクセスを安全に処理
 - ブロードキャストは送信元には配信されない
