@@ -78,8 +78,10 @@ export function registerMessagingTools(server: McpServer): void {
     description: "自分宛の未読メッセージを取得する。",
     inputSchema: {
       limit: z.number().default(10).describe("取得するメッセージの最大数"),
+      from: z.string().optional().describe("送信元セッション名でフィルタ"),
+      type: z.string().optional().describe("メッセージタイプでフィルタ"),
     },
-  }, async ({ limit }) => {
+  }, async ({ limit, from, type }) => {
     const db = getDb();
     const receiver = resolveCurrentSession();
     if (!receiver) {
@@ -99,13 +101,33 @@ export function registerMessagingTools(server: McpServer): void {
       ).get(receiver);
       const cursor = session?.broadcast_cursor ?? "0";
 
-      const messages = db.query<MessageRow, [string, string, string, number]>(
-        `SELECT * FROM messages
-         WHERE ("to" = ? AND status = 'pending')
-            OR ("to" = '*' AND "from" != ? AND timestamp > ?)
+      // フィルタ条件を動的に構築
+      const personalConds = [`"to" = ?`, `status = 'pending'`];
+      const personalParams: (string | number)[] = [receiver];
+      const broadcastConds = [`"to" = '*'`, `"from" != ?`, `timestamp > ?`];
+      const broadcastParams: (string | number)[] = [receiver, cursor];
+
+      if (from) {
+        personalConds.push(`"from" = ?`);
+        personalParams.push(from);
+        broadcastConds.push(`"from" = ?`);
+        broadcastParams.push(from);
+      }
+      if (type) {
+        personalConds.push(`type = ?`);
+        personalParams.push(type);
+        broadcastConds.push(`type = ?`);
+        broadcastParams.push(type);
+      }
+
+      const query = `SELECT * FROM messages
+         WHERE (${personalConds.join(" AND ")})
+            OR (${broadcastConds.join(" AND ")})
          ORDER BY timestamp ASC
-         LIMIT ?`
-      ).all(receiver, receiver, cursor, limit);
+         LIMIT ?`;
+      const params = [...personalParams, ...broadcastParams, limit];
+
+      const messages = db.prepare(query).all(...params) as MessageRow[];
 
       let maxBroadcastTs = cursor;
       for (const msg of messages) {

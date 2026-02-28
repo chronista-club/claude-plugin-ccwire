@@ -181,6 +181,108 @@ describe("wire_receive", () => {
     expect(getText(result)).toContain("未読メッセージはありません");
   });
 
+  test("from フィルタで特定セッションのメッセージのみ取得できる", async () => {
+    // Arrange
+    await client.callTool({ name: "wire_register", arguments: { name: "receiver" } });
+    const db = getDb();
+    db.run(
+      `INSERT INTO sessions (name, tmux_target, status, registered_at, last_seen)
+       VALUES ('alice', NULL, 'idle', ?, ?)`,
+      [new Date().toISOString(), new Date().toISOString()]
+    );
+    db.run(
+      `INSERT INTO sessions (name, tmux_target, status, registered_at, last_seen)
+       VALUES ('bob', NULL, 'idle', ?, ?)`,
+      [new Date().toISOString(), new Date().toISOString()]
+    );
+    db.run(
+      `INSERT INTO messages (id, "from", "to", type, content, timestamp, reply_to, status)
+       VALUES ('msg-alice', 'alice', 'receiver', 'task_request', 'from alice', ?, NULL, 'pending')`,
+      [new Date().toISOString()]
+    );
+    db.run(
+      `INSERT INTO messages (id, "from", "to", type, content, timestamp, reply_to, status)
+       VALUES ('msg-bob', 'bob', 'receiver', 'task_request', 'from bob', ?, NULL, 'pending')`,
+      [new Date().toISOString()]
+    );
+
+    // Act
+    const result = await client.callTool({
+      name: "wire_receive",
+      arguments: { from: "alice" },
+    });
+
+    // Assert
+    const text = getText(result);
+    expect(text).toContain("1件");
+    expect(text).toContain("from alice");
+    expect(text).not.toContain("from bob");
+  });
+
+  test("type フィルタで特定タイプのメッセージのみ取得できる", async () => {
+    // Arrange
+    await client.callTool({ name: "wire_register", arguments: { name: "receiver" } });
+    const db = getDb();
+    db.run(
+      `INSERT INTO sessions (name, tmux_target, status, registered_at, last_seen)
+       VALUES ('sender', NULL, 'idle', ?, ?)`,
+      [new Date().toISOString(), new Date().toISOString()]
+    );
+    db.run(
+      `INSERT INTO messages (id, "from", "to", type, content, timestamp, reply_to, status)
+       VALUES ('msg-task', 'sender', 'receiver', 'task_request', 'a task', ?, NULL, 'pending')`,
+      [new Date().toISOString()]
+    );
+    db.run(
+      `INSERT INTO messages (id, "from", "to", type, content, timestamp, reply_to, status)
+       VALUES ('msg-question', 'sender', 'receiver', 'question', 'a question', ?, NULL, 'pending')`,
+      [new Date().toISOString()]
+    );
+
+    // Act
+    const result = await client.callTool({
+      name: "wire_receive",
+      arguments: { type: "question" },
+    });
+
+    // Assert
+    const text = getText(result);
+    expect(text).toContain("1件");
+    expect(text).toContain("a question");
+    expect(text).not.toContain("a task");
+  });
+
+  test("フィルタなしの既存動作が変わらない", async () => {
+    // Arrange
+    await client.callTool({ name: "wire_register", arguments: { name: "receiver" } });
+    const db = getDb();
+    db.run(
+      `INSERT INTO sessions (name, tmux_target, status, registered_at, last_seen)
+       VALUES ('sender', NULL, 'idle', ?, ?)`,
+      [new Date().toISOString(), new Date().toISOString()]
+    );
+    db.run(
+      `INSERT INTO messages (id, "from", "to", type, content, timestamp, reply_to, status)
+       VALUES ('msg-1', 'sender', 'receiver', 'task_request', 'msg1', ?, NULL, 'pending')`,
+      [new Date().toISOString()]
+    );
+    db.run(
+      `INSERT INTO messages (id, "from", "to", type, content, timestamp, reply_to, status)
+       VALUES ('msg-2', 'sender', 'receiver', 'question', 'msg2', ?, NULL, 'pending')`,
+      [new Date().toISOString()]
+    );
+
+    // Act
+    const result = await client.callTool({
+      name: "wire_receive",
+      arguments: {},
+    });
+
+    // Assert: フィルタなしなら全て取得
+    const text = getText(result);
+    expect(text).toContain("2件");
+  });
+
   test("limit パラメータで取得数を制限できる", async () => {
     // Arrange
     await client.callTool({ name: "wire_register", arguments: { name: "receiver" } });
