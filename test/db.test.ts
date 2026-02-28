@@ -20,6 +20,7 @@ import {
   cleanStaleMessages,
   touchSession,
   resolveCurrentSession,
+  isPidAlive,
 } from "../src/db.js";
 
 beforeEach(async () => {
@@ -64,8 +65,8 @@ describe("initDb", () => {
 
 describe("cleanStaleSessions", () => {
   test("TTL超過セッションを削除する", () => {
-    // Arrange: 3時間前の last_seen を持つセッション
-    const staleTime = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    // Arrange: 15分前の last_seen を持つセッション（TTL 10分超過）
+    const staleTime = new Date(Date.now() - 15 * 60 * 1000).toISOString();
     insertTestSession("stale-session", { last_seen: staleTime });
 
     // Act
@@ -80,8 +81,8 @@ describe("cleanStaleSessions", () => {
   });
 
   test("TTL内セッションは削除しない", () => {
-    // Arrange: 1時間前（TTL 2h 以内）
-    const recentTime = new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString();
+    // Arrange: 5分前（TTL 10min 以内）
+    const recentTime = new Date(Date.now() - 5 * 60 * 1000).toISOString();
     insertTestSession("alive-session", { last_seen: recentTime });
 
     // Act
@@ -110,6 +111,66 @@ describe("cleanStaleSessions", () => {
       .all();
     expect(result).toHaveLength(1);
   });
+
+  test("PID が死んだセッションを削除する", () => {
+    // Arrange: 存在しない PID（99999999）を持つセッション
+    insertTestSession("dead-pid-session", { pid: 99999999 });
+
+    // Act
+    cleanStaleSessions();
+
+    // Assert
+    const db = getDb();
+    const result = db
+      .query<{ name: string }, []>(`SELECT name FROM sessions`)
+      .all();
+    expect(result).toHaveLength(0);
+  });
+
+  test("PID が生きているセッションは削除しない", () => {
+    // Arrange: 自プロセスの PID（確実に生きている）
+    insertTestSession("alive-pid-session", { pid: process.pid });
+
+    // Act
+    cleanStaleSessions();
+
+    // Assert
+    const db = getDb();
+    const result = db
+      .query<{ name: string }, []>(`SELECT name FROM sessions`)
+      .all();
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBe("alive-pid-session");
+  });
+
+  test("PID なしセッションは PID チェックをスキップする", () => {
+    // Arrange: pid = null のセッション（TTL 内）
+    insertTestSession("no-pid-session", { pid: null });
+
+    // Act
+    cleanStaleSessions();
+
+    // Assert
+    const db = getDb();
+    const result = db
+      .query<{ name: string }, []>(`SELECT name FROM sessions`)
+      .all();
+    expect(result).toHaveLength(1);
+  });
+});
+
+// ─────────────────────────────────────────────
+// isPidAlive
+// ─────────────────────────────────────────────
+
+describe("isPidAlive", () => {
+  test("自プロセスの PID は生きている", () => {
+    expect(isPidAlive(process.pid)).toBe(true);
+  });
+
+  test("存在しない PID は死んでいる", () => {
+    expect(isPidAlive(99999999)).toBe(false);
+  });
 });
 
 // ─────────────────────────────────────────────
@@ -119,7 +180,7 @@ describe("cleanStaleSessions", () => {
 describe("cleanStaleMessages", () => {
   test("TTL超過の非pending メッセージを削除する", () => {
     // Arrange
-    const staleTime = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    const staleTime = new Date(Date.now() - 15 * 60 * 1000).toISOString();
     insertTestSession("sender");
     insertTestSession("receiver");
     insertTestMessage("msg-old", {
@@ -141,7 +202,7 @@ describe("cleanStaleMessages", () => {
 
   test("pending メッセージはTTL超過でも削除しない", () => {
     // Arrange
-    const staleTime = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    const staleTime = new Date(Date.now() - 15 * 60 * 1000).toISOString();
     insertTestSession("sender");
     insertTestSession("receiver");
     insertTestMessage("msg-pending", {
@@ -216,7 +277,7 @@ describe("cleanStaleMessages", () => {
 
   test("削除件数を正しく返す", () => {
     // Arrange: TTL超過の delivered メッセージ3件
-    const staleTime = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    const staleTime = new Date(Date.now() - 15 * 60 * 1000).toISOString();
     insertTestSession("a");
     insertTestSession("b");
     insertTestMessage("m1", { from: "a", to: "b", timestamp: staleTime, status: "delivered" });

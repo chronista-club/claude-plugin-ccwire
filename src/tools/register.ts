@@ -50,9 +50,9 @@ export function registerRegisterTools(server: McpServer): void {
     ).get(name);
 
     db.run(
-      `INSERT OR REPLACE INTO sessions (name, tmux_target, status, registered_at, last_seen)
-       VALUES (?, ?, 'idle', ?, ?)`,
-      [name, validatedTmuxTarget, existing?.registered_at ?? now, now]
+      `INSERT OR REPLACE INTO sessions (name, tmux_target, pid, status, registered_at, last_seen)
+       VALUES (?, ?, ?, 'idle', ?, ?)`,
+      [name, validatedTmuxTarget, process.pid, existing?.registered_at ?? now, now]
     );
 
     setCurrentSessionName(name);

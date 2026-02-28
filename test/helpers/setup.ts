@@ -83,6 +83,7 @@ export function insertTestSession(
   name: string,
   opts: {
     tmux_target?: string | null;
+    pid?: number | null;
     status?: "idle" | "busy" | "done";
     registered_at?: string;
     last_seen?: string;
@@ -91,11 +92,12 @@ export function insertTestSession(
   const db = getDb();
   const now = new Date().toISOString();
   db.run(
-    `INSERT INTO sessions (name, tmux_target, status, registered_at, last_seen)
-     VALUES (?, ?, ?, ?, ?)`,
+    `INSERT INTO sessions (name, tmux_target, pid, status, registered_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?)`,
     [
       name,
       opts.tmux_target ?? null,
+      opts.pid ?? null,
       opts.status ?? "idle",
       opts.registered_at ?? now,
       opts.last_seen ?? now,
