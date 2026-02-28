@@ -8,7 +8,7 @@ import { isTmuxPaneAlive, clearTmuxCache } from "./tmux.js";
 // Constants
 // ─────────────────────────────────────────────
 
-const STORE_DIR = join(
+export const STORE_DIR = join(
   process.env.HOME ?? process.env.USERPROFILE ?? "/tmp",
   ".cache",
   "ccwire"
