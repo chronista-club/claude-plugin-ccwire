@@ -40,8 +40,8 @@ else
   REGISTERED_AT="$NOW"
 fi
 
-# INSERT OR REPLACE でセッション登録
-run_sql "INSERT OR REPLACE INTO sessions (name, tmux_target, status, registered_at, last_seen) VALUES ('${SAFE_NAME}', ${TMUX_TARGET}, 'idle', '${REGISTERED_AT}', '${NOW}');"
+# INSERT OR REPLACE でセッション登録（broadcast_cursor, pid も設定）
+run_sql "INSERT OR REPLACE INTO sessions (name, tmux_target, pid, broadcast_cursor, status, registered_at, last_seen) VALUES ('${SAFE_NAME}', ${TMUX_TARGET}, $$, '${NOW}', 'idle', '${REGISTERED_AT}', '${NOW}');"
 
 # 登録完了メッセージ
 SESSION_COUNT=$(run_sql "SELECT COUNT(*) FROM sessions;")

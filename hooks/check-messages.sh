@@ -23,14 +23,16 @@ if [ -n "$SESSION_NAME" ]; then
     ORDER BY timestamp ASC;
   ")
 
-  # Broadcast messages (not from me, not yet delivered to me)
+  # Broadcast messages (cursor-based: broadcast_cursor 以降の未読のみ)
+  CURSOR=$(run_sql "SELECT COALESCE(broadcast_cursor, '0') FROM sessions WHERE name = '${SAFE_SESSION}';")
+  CURSOR=${CURSOR:-0}
   BROADCAST=$(run_sql -separator '|' "
-    SELECT m.\"from\", 'broadcast', substr(m.content, 1, 120)
-    FROM messages m
-    WHERE m.\"to\" = '*'
-      AND m.\"from\" != '${SAFE_SESSION}'
-      AND m.id NOT IN (SELECT message_id FROM broadcast_deliveries WHERE session_name = '${SAFE_SESSION}')
-    ORDER BY m.timestamp ASC;
+    SELECT \"from\", 'broadcast', substr(content, 1, 120)
+    FROM messages
+    WHERE \"to\" = '*'
+      AND \"from\" != '${SAFE_SESSION}'
+      AND timestamp > '${CURSOR}'
+    ORDER BY timestamp ASC;
   ")
 else
   # No session name: show all pending messages
