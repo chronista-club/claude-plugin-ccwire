@@ -41,20 +41,18 @@ export function checkAndNotify(): void {
     `SELECT COUNT(*) as cnt FROM messages WHERE "to" = ? AND status = 'pending'`
   ).get(sessionName);
 
-  // 2. Undelivered broadcasts (not from self, not yet in broadcast_deliveries)
-  const broadcast = db.query<{ cnt: number }, [string, string]>(
-    `SELECT COUNT(*) as cnt FROM messages
-     WHERE "to" = '*' AND "from" != ?
-     AND id NOT IN (SELECT message_id FROM broadcast_deliveries WHERE session_name = ?)`
-  ).get(sessionName, sessionName);
-
-  const total = (direct?.cnt ?? 0) + (broadcast?.cnt ?? 0);
-  if (total === 0) return;
-
-  // Get own tmux target for self-notification
+  // 2. Unread broadcasts (cursor-based, #14)
   const session = db.query<Session, [string]>(
     `SELECT * FROM sessions WHERE name = ?`
   ).get(sessionName);
+  const cursor = session?.broadcast_cursor ?? "0";
+  const broadcast = db.query<{ cnt: number }, [string, string]>(
+    `SELECT COUNT(*) as cnt FROM messages
+     WHERE "to" = '*' AND "from" != ? AND timestamp > ?`
+  ).get(sessionName, cursor);
+
+  const total = (direct?.cnt ?? 0) + (broadcast?.cnt ?? 0);
+  if (total === 0) return;
 
   if (session?.tmux_target) {
     notifyViaTmux(session.tmux_target, `wire_receiveで未読メッセージを確認して`);

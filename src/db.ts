@@ -44,16 +44,16 @@ export async function initDb(dbPath?: string): Promise<void> {
       name TEXT PRIMARY KEY,
       tmux_target TEXT,
       pid INTEGER,
+      broadcast_cursor TEXT,
       status TEXT NOT NULL DEFAULT 'idle' CHECK(status IN ('idle', 'busy', 'done')),
       registered_at TEXT NOT NULL,
       last_seen TEXT NOT NULL
     )
   `);
 
-  // マイグレーション: 既存 DB に pid カラムがない場合は追加
-  try {
-    db.run(`ALTER TABLE sessions ADD COLUMN pid INTEGER`);
-  } catch { /* already exists */ }
+  // マイグレーション: 既存 DB にカラムがない場合は追加
+  try { db.run(`ALTER TABLE sessions ADD COLUMN pid INTEGER`); } catch { /* already exists */ }
+  try { db.run(`ALTER TABLE sessions ADD COLUMN broadcast_cursor TEXT`); } catch { /* already exists */ }
 
   db.run(`
     CREATE TABLE IF NOT EXISTS messages (
@@ -69,14 +69,6 @@ export async function initDb(dbPath?: string): Promise<void> {
   `);
 
   db.run(`
-    CREATE TABLE IF NOT EXISTS broadcast_deliveries (
-      message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-      session_name TEXT NOT NULL,
-      PRIMARY KEY (message_id, session_name)
-    )
-  `);
-
-  db.run(`
     CREATE TABLE IF NOT EXISTS audit_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       action TEXT NOT NULL,
@@ -86,10 +78,12 @@ export async function initDb(dbPath?: string): Promise<void> {
     )
   `);
 
+  // マイグレーション: broadcast_deliveries テーブルが残っていれば削除 (#14)
+  db.run(`DROP TABLE IF EXISTS broadcast_deliveries`);
+
   db.run(`CREATE INDEX IF NOT EXISTS idx_messages_to_status ON messages("to", status)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_broadcast_deliveries_session ON broadcast_deliveries(session_name)`);
 }
 
 // ─────────────────────────────────────────────
@@ -199,11 +193,6 @@ export function cleanStaleMessages(): number {
   db.run(
     `DELETE FROM messages WHERE status = 'pending' AND "to" != '*'
      AND "to" NOT IN (SELECT name FROM sessions)`
-  );
-
-  // broadcast_deliveries の TTL クリーンアップ: 対応メッセージが存在しないレコードを削除 (Issue #5)
-  db.run(
-    `DELETE FROM broadcast_deliveries WHERE message_id NOT IN (SELECT id FROM messages)`
   );
 
   return result.changes;

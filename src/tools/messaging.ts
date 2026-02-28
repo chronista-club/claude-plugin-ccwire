@@ -93,24 +93,32 @@ export function registerMessagingTools(server: McpServer): void {
 
     // トランザクションで SELECT → UPDATE をアトミックに実行 (Issue #5)
     const allMessages = db.transaction(() => {
+      // broadcast_cursor を取得（cursor 以降の broadcast を取得する）
+      const session = db.query<Session, [string]>(
+        `SELECT * FROM sessions WHERE name = ?`
+      ).get(receiver);
+      const cursor = session?.broadcast_cursor ?? "0";
+
       const messages = db.query<MessageRow, [string, string, string, number]>(
         `SELECT * FROM messages
          WHERE ("to" = ? AND status = 'pending')
-            OR ("to" = '*' AND "from" != ?
-                AND id NOT IN (SELECT message_id FROM broadcast_deliveries WHERE session_name = ?))
+            OR ("to" = '*' AND "from" != ? AND timestamp > ?)
          ORDER BY timestamp ASC
          LIMIT ?`
-      ).all(receiver, receiver, receiver, limit);
+      ).all(receiver, receiver, cursor, limit);
 
+      let maxBroadcastTs = cursor;
       for (const msg of messages) {
         if (msg.to === "*") {
-          db.run(
-            `INSERT OR IGNORE INTO broadcast_deliveries (message_id, session_name) VALUES (?, ?)`,
-            [msg.id, receiver]
-          );
+          if (msg.timestamp > maxBroadcastTs) maxBroadcastTs = msg.timestamp;
         } else {
           db.run(`UPDATE messages SET status = 'delivered' WHERE id = ?`, [msg.id]);
         }
+      }
+
+      // broadcast_cursor を更新
+      if (maxBroadcastTs > cursor) {
+        db.run(`UPDATE sessions SET broadcast_cursor = ? WHERE name = ?`, [maxBroadcastTs, receiver]);
       }
 
       return messages;

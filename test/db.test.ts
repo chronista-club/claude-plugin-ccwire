@@ -47,7 +47,6 @@ describe("initDb", () => {
 
     expect(tables).toContain("sessions");
     expect(tables).toContain("messages");
-    expect(tables).toContain("broadcast_deliveries");
     expect(tables).toContain("audit_log");
   });
 
@@ -256,23 +255,6 @@ describe("cleanStaleMessages", () => {
     const db = getDb();
     const msgs = db.query<{ id: string }, []>(`SELECT id FROM messages`).all();
     expect(msgs).toHaveLength(1);
-  });
-
-  test("孤立したbroadcast_deliveriesを削除する", () => {
-    // Arrange: メッセージなしの broadcast_deliveries レコード
-    const db = getDb();
-    db.run(
-      `INSERT INTO broadcast_deliveries (message_id, session_name) VALUES ('orphan-msg', 'some-session')`
-    );
-
-    // Act
-    cleanStaleMessages();
-
-    // Assert
-    const rows = db
-      .query<{ message_id: string }, []>(`SELECT * FROM broadcast_deliveries`)
-      .all();
-    expect(rows).toHaveLength(0);
   });
 
   test("削除件数を正しく返す", () => {
