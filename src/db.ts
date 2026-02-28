@@ -15,8 +15,8 @@ export const STORE_DIR = join(
 );
 const DB_PATH = join(STORE_DIR, "ccwire.db");
 
-// Session TTL: 2 hours (zombie session mitigation)
-const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
+// Session TTL: 10 minutes (heartbeat-based zombie mitigation, #15)
+const SESSION_TTL_MS = 10 * 60 * 1000;
 
 const AUDIT_LOG_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -43,11 +43,17 @@ export async function initDb(dbPath?: string): Promise<void> {
     CREATE TABLE IF NOT EXISTS sessions (
       name TEXT PRIMARY KEY,
       tmux_target TEXT,
+      pid INTEGER,
       status TEXT NOT NULL DEFAULT 'idle' CHECK(status IN ('idle', 'busy', 'done')),
       registered_at TEXT NOT NULL,
       last_seen TEXT NOT NULL
     )
   `);
+
+  // マイグレーション: 既存 DB に pid カラムがない場合は追加
+  try {
+    db.run(`ALTER TABLE sessions ADD COLUMN pid INTEGER`);
+  } catch { /* already exists */ }
 
   db.run(`
     CREATE TABLE IF NOT EXISTS messages (
@@ -123,15 +129,46 @@ export function cleanStaleAuditLogs(): void {
 // ─────────────────────────────────────────────
 
 /**
+ * PID が生存しているかチェックする（tmux 非依存）。
+ * kill(pid, 0) はシグナルを送らず、プロセスの存在のみ確認する。
+ */
+export function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * cleanStaleSessions: ゾンビセッションの削除
  * @param fullCheck true: キャッシュ無視でフルチェック (wire_sessions, wire_register 用)
+ *
+ * 3層のゾンビ検知:
+ * 1. TTL ベース: last_seen が SESSION_TTL_MS を超えたセッションを削除
+ * 2. PID ライブネス: pid が記録されていればプロセス生存を確認 (#15)
+ * 3. tmux ライブネス: tmux_target があればペイン生存を確認
  */
 export function cleanStaleSessions(fullCheck = false): void {
-  // TTL-based cleanup
+  // 1. TTL-based cleanup
   const cutoff = new Date(Date.now() - SESSION_TTL_MS).toISOString();
   db.run(`DELETE FROM sessions WHERE last_seen < ?`, [cutoff]);
 
-  // tmux liveness check: tmux_target があるセッションはペイン生存を確認
+  // 2. PID liveness check: pid が記録されたセッションはプロセス生存を確認 (#15)
+  const pidSessions = db.query<Session, []>(
+    `SELECT * FROM sessions WHERE pid IS NOT NULL`
+  ).all();
+
+  for (const s of pidSessions) {
+    if (!isPidAlive(s.pid!)) {
+      db.run(`DELETE FROM sessions WHERE name = ?`, [s.name]);
+      if (s.tmux_target) clearTmuxCache(s.tmux_target);
+      auditLog("auto_cleanup", s.name, { reason: "pid_dead", pid: s.pid });
+    }
+  }
+
+  // 3. tmux liveness check: tmux_target があり、まだ残っているセッションのペイン生存を確認
   const tmuxSessions = db.query<Session, []>(
     `SELECT * FROM sessions WHERE tmux_target IS NOT NULL`
   ).all();

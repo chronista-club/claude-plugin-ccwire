@@ -35,7 +35,8 @@ export function registerSessionsTools(server: McpServer): void {
     const lines = sessions.map((s) => {
       const isSelf = s.name === self ? " (自分)" : "";
       const tmux = s.tmux_target ? ` [tmux: ${s.tmux_target}]` : "";
-      return `  ${s.name}${isSelf} - ${s.status}${tmux} (last: ${s.last_seen})`;
+      const pid = s.pid ? ` [pid: ${s.pid}]` : "";
+      return `  ${s.name}${isSelf} - ${s.status}${tmux}${pid} (last: ${s.last_seen})`;
     });
 
     const cleanInfo = cleanedMsgs > 0 ? `\n(${cleanedMsgs} 件の古いメッセージを削除)` : "";
