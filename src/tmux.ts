@@ -21,11 +21,20 @@ export function isTmuxPaneAlive(tmuxTarget: string, useCache = true): boolean {
     }
   }
 
-  let alive = false;
+  let alive = true; // デフォルトは alive（判定不能なら殺さない）
   try {
     const result = Bun.spawnSync(["tmux", "display-message", "-t", tmuxTarget, "-p", "#{pane_id}"]);
-    alive = result.exitCode === 0;
-  } catch { /* tmux not available */ }
+    const stderr = result.stderr?.toString() ?? "";
+    if (stderr.includes("no server running") || stderr.includes("server not found")) {
+      // tmux サーバー自体に到達できない — 環境の問題なので判定しない
+      alive = true;
+    } else if (result.exitCode === 0) {
+      alive = true;
+    } else {
+      // tmux は動いているが、このペインが存在しない — 本当に dead
+      alive = false;
+    }
+  } catch { /* tmux not available — keep session alive */ }
 
   tmuxLivenessCache.set(tmuxTarget, { alive, checkedAt: Date.now() });
   return alive;
