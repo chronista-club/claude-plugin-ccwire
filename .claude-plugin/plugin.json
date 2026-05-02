@@ -15,11 +15,7 @@
     "messaging",
     "mcp"
   ],
-  "mcpServers": {
-    "ccwire": {
-      "type": "stdio",
-      "command": "bun",
-      "args": ["run", "${CLAUDE_PLUGIN_ROOT}/src/server.ts"]
-    }
-  }
+  "mcpServers": "${CLAUDE_PLUGIN_ROOT}/.mcp.json",
+  "license": "MIT",
+  "homepage": "https://github.com/chronista-club/claude-plugin-ccwire"
 }
