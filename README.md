@@ -1,5 +1,11 @@
 # ccwire - CC間通信プロトコル
 
+> [!NOTE]
+> **このリポジトリはアーカイブされました（2026-05-26）**
+> 後継: **Mailbox** — vantage-point の `crates/vp-mailbox` に統合されました。
+> ccwire の `cc_wire` 系コマンドは Mailbox の `msg_send` / `msg_recv` / `msg_thread` / `msg_ack` に対応します。
+> 永続化が opt-in 不要になり、Process 再起動を跨いだメッセージ復元が可能になりました。
+
 複数のClaude Codeセッション間でリアルタイムにメッセージをやり取りするためのプラグイン。
 
 ## インストール
